@@ -79,6 +79,8 @@ class GridEngine:
         self._cycle_seq = 0
         self._order_seq = 0
         self._stop_event = asyncio.Event()
+        self._bootstrap_cid: Optional[str] = None
+        self._bootstrap_pending = False
 
     async def initialize(self, bot_run_id: int, bot_run_short_id: str) -> None:
         """
@@ -284,7 +286,7 @@ class GridEngine:
                     break
                 self._submit_level_order(level, cycle_id=0)
         elif bot.inventory_mode == "quote_only_bootstrap":
-            log.info("quote_only_bootstrap mód – nincs kezdeti sell order")
+            await self._execute_bootstrap()
 
         log.info("Kezdeti order-ek bekülve (non-blocking)")
 
@@ -326,12 +328,16 @@ class GridEngine:
         Ha külső cancel → policy alapján reakció.
         """
         if self.status == BotStatus.EMERGENCY_STOPPING:
-            return  # Emergency stop közben nem generálunk új order-t
+            return
 
         cid = report.client_order_id
-
-        # Csak a saját bot-hoz tartozó order-ek
         if not cid.startswith("G-"):
+            return
+
+        # Bootstrap fill kezelése
+        if self._bootstrap_cid and cid == self._bootstrap_cid:
+            if report.execution_type == "TRADE" and report.order_status == "FILLED":
+                await self._on_bootstrap_filled(report)
             return
 
         if report.execution_type == "TRADE" and report.order_status == "FILLED":
@@ -404,6 +410,118 @@ class GridEngine:
             if lv.index == index:
                 return lv
         return None
+
+    async def _execute_bootstrap(self) -> None:
+        """Bootstrap: MARKET buy küldése a sell grid orderekhez szükséges base megszerzéséhez."""
+        bootstrap = self.settings.bootstrap
+        bot = self.settings.bot
+        assert self.grid_plan is not None
+
+        quote_qty = bootstrap.quote_qty
+        if quote_qty is None:
+            quote_qty = bot.total_capital_quote * bot.buy_allocation_ratio
+
+        self._order_seq += 1
+        cid = f"G-{self._bot_run_short_id}-BOOT-{self._order_seq:04d}"
+        self._bootstrap_cid = cid
+        self._bootstrap_pending = True
+
+        bootstrap_price = Decimal("0")
+        bootstrap_qty = Decimal("0")
+
+        if bootstrap.order_type == "MARKET":
+            self.ws_api.enqueue_market_buy(
+                symbol=bot.symbol,
+                quote_order_qty=quote_qty,
+                client_order_id=cid,
+            )
+            bootstrap_price = self.grid_plan.anchor_price
+            bootstrap_qty = quote_qty / bootstrap_price
+            log.info("Bootstrap MARKET buy beküldve", cid=cid, quote_qty=str(quote_qty))
+        else:
+            assert self.symbol_info is not None
+            anchor = self.grid_plan.anchor_price
+            offset = bootstrap.limit_price_offset_pct
+            from exchange.precision import round_price_to_tick, round_down_to_step
+            bootstrap_price = round_price_to_tick(
+                anchor * (Decimal("1") - offset),
+                self.symbol_info.price_filter.tick_size,
+            )
+            bootstrap_qty = round_down_to_step(
+                quote_qty / bootstrap_price,
+                self.symbol_info.lot_size.step_size,
+            )
+            self.ws_api.enqueue_order(
+                symbol=bot.symbol,
+                side="BUY",
+                order_type=bootstrap.order_type,
+                price=bootstrap_price,
+                quantity=bootstrap_qty,
+                client_order_id=cid,
+                time_in_force="GTC",
+            )
+            log.info("Bootstrap LIMIT buy beküldve", cid=cid, price=str(bootstrap_price), qty=str(bootstrap_qty))
+
+        self.db_queue.put_nowait(DbEvent(
+            type="upsert_order_from_intent",
+            data={
+                "bot_run_id": self.bot_run_id,
+                "client_order_id": cid,
+                "symbol": bot.symbol,
+                "side": "BUY",
+                "order_type": bootstrap.order_type,
+                "time_in_force": "GTC",
+                "price": bootstrap_price,
+                "original_quantity": bootstrap_qty,
+                "executed_quantity": Decimal("0"),
+                "cumulative_quote_quantity": Decimal("0"),
+                "status_local": "SUBMIT_QUEUED",
+                "grid_level_index": 0,
+                "cycle_id": "bootstrap",
+            },
+        ))
+
+        self.db_queue.put_nowait(DbEvent(
+            type="log_system_event",
+            data={
+                "severity": "INFO",
+                "component": "engine",
+                "event_type": "bootstrap_initiated",
+                "message": f"Bootstrap {bootstrap.order_type} buy beküldve: {quote_qty} {bot.quote_asset}",
+                "payload": {"cid": cid, "quote_qty": str(quote_qty), "order_type": bootstrap.order_type},
+            },
+        ))
+
+    async def _on_bootstrap_filled(self, report: ExecutionReport) -> None:
+        """Bootstrap fill: sell grid orderek elhelyezése a szerzett base-szel."""
+        self._bootstrap_pending = False
+        self._bootstrap_cid = None
+        assert self.grid_plan is not None
+
+        acquired = report.cumulative_filled_qty
+        if report.commission_asset == self.settings.bot.base_asset:
+            acquired -= report.commission_amount
+
+        avg_price = report.cumulative_quote_qty / report.cumulative_filled_qty if report.cumulative_filled_qty > 0 else Decimal("0")
+        log.info(
+            "Bootstrap fill kész",
+            acquired_base=str(acquired),
+            spent_quote=str(report.cumulative_quote_qty),
+            avg_price=str(avg_price),
+        )
+
+        placed = 0
+        remaining = acquired
+        for level in self.grid_plan.sell_levels:
+            if remaining < level.quantity:
+                log.info("Bootstrap: nincs elég base a további sell szintekhez",
+                         remaining=str(remaining), needed=str(level.quantity))
+                break
+            self._submit_level_order(level, cycle_id=0)
+            remaining -= level.quantity
+            placed += 1
+
+        log.info("Bootstrap sell orderek beküldve", count=placed, remaining_base=str(remaining))
 
     async def on_external_cancel(self, report: ExecutionReport) -> None:
         """Külső beavatkozás: order törlése nem a bot által."""

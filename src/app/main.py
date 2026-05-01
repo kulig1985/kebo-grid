@@ -397,13 +397,43 @@ async def main() -> None:
         await _shutdown.wait()
         log.info("Leállítás...")
 
-        # Graceful shutdown
-        await ws_api.stop()
+        # Graceful shutdown: előbb orderek törlése, aztán kapcsolatok bontása
+        await watchdog.stop()
+        await reconciliation.stop()
+
+        symbol = settings.bot.symbol
+        if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
+            log.info("Nyitott orderek törlése leállítás előtt", symbol=symbol)
+            ws_api.enqueue_cancel_all(symbol)
+            engine.status = "STOPPED"
+
+            # Várunk a cancelAll végrehajtására (max 5s)
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                try:
+                    open_orders = await asyncio.wait_for(
+                        ws_api.get_open_orders(symbol), timeout=3.0
+                    )
+                    if not open_orders:
+                        log.info("Minden order törölve")
+                        break
+                    log.info("Várakozás order törlésre", remaining=len(open_orders))
+                except Exception:
+                    break
+            else:
+                log.warning("Nem sikerült az összes ordert törölni leállítás előtt")
+
+        if engine.bot_run_id:
+            db_queue.put_nowait(DbEvent(
+                type="update_bot_status",
+                data={"run_id": engine.bot_run_id, "status": "STOPPED"},
+            ))
+            await asyncio.sleep(0.5)
+
         await user_stream.stop()
         await market_stream.stop()
+        await ws_api.stop()
         await db_writer.stop()
-        await reconciliation.stop()
-        await watchdog.stop()
         uv_server.should_exit = True
 
     await close_db()
