@@ -1,12 +1,12 @@
 exchange:
-  env: testnet
+  env: testnet                   # testnet | mainnet
   ws_api_url_mainnet: wss://ws-api.binance.com:443/ws-api/v3
   ws_api_url_testnet: wss://ws-api.testnet.binance.vision/ws-api/v3
   user_stream_url_mainnet: wss://stream.binance.com:9443/ws
   user_stream_url_testnet: wss://stream.testnet.binance.vision:9443/ws
   rest_url_mainnet: https://api.binance.com
   rest_url_testnet: https://testnet.binance.vision
-  api_key_env: BINANCE_API_KEY
+  api_key_env: BINANCE_API_KEY   # env var neve (a kulcs a .env fájlban van)
   secret_key_env: BINANCE_SECRET_KEY
   recv_window_ms: 5000
 
@@ -14,51 +14,122 @@ bot:
   symbol: SOLUSDT
   base_asset: SOL
   quote_asset: USDT
+
   total_capital_quote: "50"
-  order_quote_value: "5"
+  # ▶ A bot által kezelt összes tőke USDT-ben.
+  # Ebből vonjuk le a tartalékot, és ez osztódik szét a grid szintek között.
+
+  # order_quote_value: "2.5"
+  # ▶ OPCIONÁLIS – ha nem adod meg, a rendszer automatikusan kiszámolja:
+  #     order_quote_value = total_capital × (1 - tartalék%) / max_grid_levels
+  #     pl. 50 × 0.98 / 20 = 2.45 USDT / szint
+  # Ha megadod: a rendszer ellenőrzi, hogy belefér-e a tőkébe.
+  # HIBA, ha: order_quote_value ≥ total_capital_quote (pl. 100 és 50)
+
   target_net_profit_per_cycle_quote: "0.02"
+  # ▶ Minimálisan elvárt NETTÓ profit egy buy-sell körön (USDT).
+  # A rendszer EBBŐL SZÁMOLJA a szükséges grid lépés %-ot!
+  #   képlet: r = (1 + fee_buy + profit/order_value) / (1 - fee_sell)
+  # Példa: 5 USDT/order, 0.1% díj, 0.02 USDT profit cél → r ≈ 1.006 (0.6% lépés)
+  # Ha növeled: ritkább szintek, nagyobb profit körvonként, kevesebb kötés
+  # Ha csökkented: sűrűbb szintek, kisebb profit körvonként, több kötés
+
   grid_type: geometric
+  # geometric: szintek közötti távolság %-os (természetes volatilitáshoz jobb)
+  # arithmetic: szintek közötti távolság fix USDT összeg
+
   inventory_mode: prebalanced
+  # prebalanced:          van meglévő SOL-od, azt használja sell order-ekhez
+  # use_existing_balances: hasonló, meglévő egyenleget használja
+  # quote_only_bootstrap: csak USDT-d van → először vásárol SOL-t (ld. bootstrap szekció)
+
   buy_allocation_ratio: "0.5"
-  quote_reserve_pct: "0.02"
-  base_reserve_pct: "0.02"
+  # A szintek hány %-a legyen buy oldal. 0.5 = 50-50.
+  # 0.6 → több buy szint, kevesebb sell szint (ha inkább esésre számítasz)
+
+  quote_reserve_pct: "0.02"     # USDT egyenleg 2%-a tartalékban marad
+  base_reserve_pct: "0.02"      # SOL egyenleg 2%-a tartalékban marad
+
   order_type: LIMIT_MAKER
-  time_in_force: GTC
+  # LIMIT_MAKER (ajánlott): post-only, csak maker díjat fizet
+  #   Ha az ár azonnal teljesítené → Binance visszautasítja (nem piaci ár)
+  # LIMIT: hagyományos limit, taker-ként is teljesülhet
+
+  time_in_force: GTC            # Good Till Canceled
+
   max_grid_levels: 20
+  # Maximum grid szintek száma összesen (buy + sell).
+  # Ha nincs megadva order_quote_value: ez határozza meg egy szint méretét is.
+
   min_grid_step_pct: "0.0025"
+  # ▶ BIZTONSÁGI ALSÓ KORLÁT – nem a tényleges lépés!
+  # Ha a számított lépés kisebb lenne ennél (0.25%), ez az érték lép életbe.
+  # Célja: megakadályozni a túl szoros gridekat ahol slippage eliminálja a profitot.
+
   max_grid_step_pct: "0.05"
+  # ▶ BIZTONSÁGI FELSŐ KORLÁT – ha a számított lépés meghaladja ezt (5%),
+  # a bot HIBÁVAL ÁLL LE induláskor. Valószínűleg elírás van a konfigban.
+
+bootstrap:
+  # Csak inventory_mode: quote_only_bootstrap esetén aktív
+  order_type: MARKET
+  # MARKET: azonnali végrehajtás (taker díj, de azonnal benne van a piacban)
+  # LIMIT:  limit áron, limit_price_offset_pct %-kal az anchor alá
+  # LIMIT_MAKER: post-only limit (olcsóbb de lassabb belépés)
+
+  # quote_qty: "25"
+  # Mennyi USDT-ért vegyen SOL-t a bootstrap lépésben.
+  # Ha nem adod meg: automatikus = total_capital × buy_allocation_ratio
+  #   pl. 50 × 0.5 = 25 USDT-ért vesz SOL-t
+
+  limit_price_offset_pct: "0.001"
+  # LIMIT/LIMIT_MAKER esetén: ennyivel az anchor ár ALATTI áron ad limit ordert
+  # 0.001 = 0.1%-kal lejjebb
 
 fees:
   fee_mode: maker_assumed
-  maker_fee_buy: "0.001"
-  maker_fee_sell: "0.001"
+  # maker_assumed: LIMIT_MAKER order-ekhez (standard esethez megfelelő)
+  # taker_assumed: LIMIT order-ekhez ahol taker is lehetsz
+  # custom:        maker_fee_buy és taker_fee_sell eltérő értékek esetén
+
+  maker_fee_buy: "0.001"    # 0.1% – standard Binance alap díj
+  maker_fee_sell: "0.001"   # BNB-vel fizetés esetén: "0.00075"
   taker_fee_buy: "0.001"
   taker_fee_sell: "0.001"
+  # ▶ Hol nézd meg a te díjaidat: Binance → Felhasználói menü → Díjak
 
 anchor:
-  source: best_bid_ask_mid  # induláskor az aktuális bid/ask közép lesz az anchor
-  # manual_price: "170"     # csak source: manual esetén szükséges
+  source: best_bid_ask_mid
+  # best_bid_ask_mid (ajánlott): induláskor az aktuális bid/ask közép
+  # last_trade:                  utolsó kötési ár
+  # manual:                      fix ár (töltsd ki manual_price-t)
+  # manual_price: "170"          # csak source: manual esetén
 
 safety:
   external_intervention_policy: pause
-  max_user_stream_staleness_sec: 10
+  # Mi történjen ha kézzel törölsz egy ordert a Binance felületén:
+  # pause:              bot szünetel (ajánlott)
+  # continue_reconcile: fut tovább, megpróbál szinkronizálni
+  # emergency_stop:     azonnal leáll és mindent töröl
+
+  max_user_stream_staleness_sec: 10   # Ha 10mp-nél régebben nincs esemény → vészleállítás
   max_trading_ws_staleness_sec: 10
-  cancel_retry_interval_sec: 2
-  cancel_retry_max: 5
+  cancel_retry_interval_sec: 2        # Vészleállítás: cancelAll újrapróbálás (mp)
+  cancel_retry_max: 5                 # Maximum újrapróbálkozás
   emergency_stop_on_db_queue_full: true
   emergency_stop_on_balance_mismatch: true
-  sell_on_emergency_stop: false
+  sell_on_emergency_stop: false       # true: piaci áron eladja a SOL-t leálláskor
 
 database:
-  host: localhost
-  port: 5432
+  host: localhost           # Felülírható: DB_HOST env var
+  port: 5432                # Felülírható: DB_PORT env var
   name: kebo_db
   user: kebo_grid
-  password_env: DATABASE_PASSWORD
+  password_env: DATABASE_PASSWORD   # A jelszó a .env fájlban van
   pool_min_size: 1
   pool_max_size: 10
   writer_queue_max_size: 10000
 
 logging:
-  level: INFO
-  json: true
+  level: INFO     # DEBUG | INFO | WARNING | ERROR
+  json: true      # true: JSON (Docker/log aggregátor); false: olvasható szöveg

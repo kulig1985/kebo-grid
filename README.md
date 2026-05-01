@@ -310,21 +310,25 @@ bot:
   quote_asset: USDT         # Az árfolyam eszköz (pl. USDT)
   
   total_capital_quote: "50"
-  # Mennyi USDT-t kezel ez a bot összesen.
-  # Ebből vonjuk le a tartalékot, ebből jönnek a buy order-ek és
-  # az initial sell order-ekhez szükséges base eszköz fedezete.
+  # ▶ EGYETLEN KÖTELEZŐ TŐKE-PARAMÉTER.
+  # A bot által kezelt összes USDT. Ebből számítja a rendszer,
+  # mennyi jut egy grid vonalra (ha order_quote_value nincs megadva).
   
-  order_quote_value: "5"
-  # Egy order értéke USDT-ben.
-  # Pl. 5 USDT: minden vételi order ~5 USDT értékű SOL-t vesz,
-  # minden eladási order ~5 USDT értékű SOL-t ad el.
-  # Fontos: Binance min_notional filter-nek teljesülnie kell (általában 1-5 USDT).
+  # order_quote_value: "2.5"
+  # ▶ OPCIONÁLIS – ha kihagyod, a rendszer AUTOMATIKUSAN kiszámolja:
+  #     order_quote_value = total_capital × (1 - tartalék%) / max_grid_levels
+  #     Példa: 50 × 0.98 / 20 = 2.45 USDT / szint
+  # Ha megadod: validálás fut – HIBA ha order_quote_value ≥ total_capital,
+  # vagy ha nem fér bele legalább 2 grid szint.
+  # Tehát: total_capital=50 és order_quote_value=100 → HIBA induláskor.
   
   target_net_profit_per_cycle_quote: "0.02"
-  # Célzott MINIMÁLIS nettó profit egy buy-sell cikluson (USDT-ben).
-  # A bot ebből SZÁMOLJA KI a szükséges grid lépést:
-  #   r = (1 + fee_buy + 0.02/5) / (1 - fee_sell)
-  # Minél nagyobb ez az érték, annál szélesebb lesz a grid lépés.
+  # ▶ Minimálisan elvárt NETTÓ profit egy buy-sell körön (USDT).
+  # A bot EBBŐL SZÁMOLJA a grid lépés %-ot!
+  #   r = (1 + fee_buy + profit/order_value) / (1 - fee_sell)
+  # Példa: 2.5 USDT/order, 0.1% díj, 0.02 USDT cél → r ≈ 1.009 (0.9% lépés)
+  # Növeld: ritkább szintek, nagyobb profit körvonként, kevesebb kötés
+  # Csökkentsd: sűrűbb szintek, kisebb profit körvonként, több kötés
   
   grid_type: geometric
   # "geometric": a szintek közötti távolság % arányos (r-szoros)
@@ -334,10 +338,10 @@ bot:
   #   → minden szinten azonos USD távolság
   
   inventory_mode: prebalanced
-  # "prebalanced": van meglévő base eszközöd (SOL), azt használja sell order-ekhez
+  # "prebalanced":          van meglévő SOL-od, azt használja sell order-ekhez
   # "use_existing_balances": hasonló, meglévő egyenleget használja
-  # "quote_only_bootstrap": csak USDT-d van, először vásárol SOL-t,
-  #   majd utána rak fel sell order-eket
+  # "quote_only_bootstrap": csak USDT-d van → először vásárol SOL-t,
+  #   majd utána rak fel sell order-eket (ld. bootstrap szekció)
   
   buy_allocation_ratio: "0.5"
   # A tőke mekkora hányada megy buy szintekre vs sell szintekre.
@@ -406,6 +410,38 @@ Ha VIP1+ vagy: kevesebb.
 A bot ezeket a díjakat arra használja, hogy **kiszámolja a minimálisan szükséges grid lépést**, ami felett a ciklus profitábilis. Ha rosszul adod meg (pl. 0-t), a grid túl szoros lesz és veszteséges lesz minden ciklus.
 
 **Hol nézd meg a te díjaidat?** Binance → Felhasználói menü → Díjak.
+
+### `bootstrap` – kezdeti SOL vásárlás (csak `quote_only_bootstrap` módban)
+
+```yaml
+bootstrap:
+  order_type: MARKET
+  # MARKET (ajánlott): piaci áron azonnal végrehajtódik → azonnal benne vagy
+  #   Hátránya: taker díjat fizet (0.1%)
+  # LIMIT:        limit áron, limit_price_offset_pct %-kal az anchor alá
+  # LIMIT_MAKER:  post-only limit (legolcsóbb de nem biztos mikor tölt)
+
+  # quote_qty: "25"
+  # Mennyi USDT-ért vegyen SOL-t a bootstrap lépésben.
+  # Ha kihagyod: automatikus = total_capital_quote × buy_allocation_ratio
+  #   Példa: 50 USDT × 0.5 = 25 USDT-ért vesz SOL-t
+
+  limit_price_offset_pct: "0.001"
+  # Csak LIMIT/LIMIT_MAKER bootstrap esetén: ennyivel az anchor ár ALATTI
+  # áron ad le limit ordert (0.001 = 0.1%-kal lejjebb)
+```
+
+**Bootstrap folyamat** (`quote_only_bootstrap`):
+```
+1. Bot indul → nincs SOL az accounton
+2. Anchor price meghatározás (pl. 170 USDT)
+3. Bootstrap order küldés:
+   - MARKET: quoteOrderQty=25 USDT → azonnali SOL vásárlás
+   - LIMIT:  169.83 USDT áron (170 × (1 - 0.001)) limit order
+4. Várakozás: user stream executionReport FILLED eseményre
+5. SOL megérkezett → sell order-ek elhelyezése a grid szintekre
+6. Buy order-ek elhelyezése
+```
 
 ### `anchor` – a grid közepe
 
@@ -520,6 +556,58 @@ alembic upgrade head
 | `ws_connections` | WebSocket kapcsolat log (csatlakozás, disconnect, ping/pong) |
 | `system_events` | Rendszer alertek, watchdog események |
 | `api_audit` | API hívások naplója |
+
+### Több bot párhuzamosan – hogyan különíti el az adatokat az adatbázis?
+
+**Minden táblában van egy `bot_run_id` mező** – ez az egyedi azonosító. Minden bot indításkor kap egyet a `bot_runs` táblában.
+
+```
+bot_runs tábla:
+  id=1  symbol=SOLUSDT  status=RUNNING   started_at=2026-05-01 10:00
+  id=2  symbol=BTCUSDT  status=RUNNING   started_at=2026-05-01 10:05
+  id=3  symbol=SOLUSDT  status=STOPPED   started_at=2026-04-30 09:00
+
+orders tábla:
+  id=..  bot_run_id=1  client_order_id=G-000001-B-001-0000-01  symbol=SOLUSDT ...
+  id=..  bot_run_id=2  client_order_id=G-000002-B-001-0000-01  symbol=BTCUSDT ...
+
+fills tábla:
+  id=..  bot_run_id=1  trade_id=9988  symbol=SOLUSDT ...
+  id=..  bot_run_id=2  trade_id=1234  symbol=BTCUSDT ...
+```
+
+**Lekérdezés SQL-ben:**
+```sql
+-- Melyik botok futnak éppen?
+SELECT id, symbol, status, started_at FROM bot_runs WHERE status='RUNNING';
+
+-- Egy adott bot (id=1) összes ordere
+SELECT * FROM orders WHERE bot_run_id = 1;
+
+-- Egy adott bot mai kötései
+SELECT * FROM fills WHERE bot_run_id = 1 ORDER BY transaction_time DESC;
+
+-- Összesített P&L bot_run_id szerint
+SELECT bot_run_id, SUM(quote_quantity - commission_amount) FROM fills GROUP BY bot_run_id;
+```
+
+**Az API-n keresztül:**
+```bash
+GET /bot/runs          → összes bot_run listája
+GET /bot/runs/1/orders → az id=1 bot orderei
+GET /bot/runs/2/fills  → az id=2 bot kötései
+```
+
+**A `clientOrderId` is tartalmazza a bot azonosítóját:**
+```
+G-000001-B-001-0000-01
+  │       │   │   │   └─ sorszám
+  │       │   │   └───── ciklus szám
+  │       │   └─────────── grid szint
+  │       └─────────────── B=BUY / S=SELL
+  └─────────────────────── bot_run_id base36 kódolva
+```
+Ha valaki megnézi a Binance felületén az open order-eket, a `clientOrderId` alapján látható melyik bot, melyik szint, melyik ciklus.
 
 ---
 

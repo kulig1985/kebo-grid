@@ -43,9 +43,23 @@ class BotConfig(BaseModel):
     symbol: str = "SOLUSDT"
     base_asset: str = "SOL"
     quote_asset: str = "USDT"
+
     total_capital_quote: Decimal = Decimal("50")
-    order_quote_value: Decimal = Decimal("5")
+    # A bot által kezelt teljes tőke (USDT). Ez az egyetlen kötelező tőke-paraméter.
+    # Ebből számítja a rendszer, hogy mennyi jut egy grid vonalra.
+
+    order_quote_value: Optional[Decimal] = None
+    # Egy grid vonal USDT értéke. Ha nem adod meg, a rendszer automatikusan kiszámolja:
+    #   order_quote_value = (total_capital_quote × (1 - quote_reserve_pct)) / max_grid_levels
+    # Ha megadod: validálja, hogy belefér a tőkébe és legalább 2 szint létrejöhet.
+
     target_net_profit_per_cycle_quote: Decimal = Decimal("0.02")
+    # Minimálisan elvárt NETTÓ profit egy buy-sell körön (USDT-ben).
+    # Ebből SZÁMOLJA a rendszer a szükséges grid lépés %-ot:
+    #   r = (1 + fee_buy + profit/order_value) / (1 - fee_sell)
+    # Minél nagyobb, annál ritkábbak a szintek (de több profit körvonként).
+    # Minél kisebb, annál sűrűbb a grid (de kisebb profit).
+
     grid_type: Literal["geometric", "arithmetic"] = "geometric"
     inventory_mode: Literal["prebalanced", "quote_only_bootstrap", "use_existing_balances"] = "prebalanced"
     buy_allocation_ratio: Decimal = Decimal("0.5")
@@ -60,6 +74,56 @@ class BotConfig(BaseModel):
     sell_side_order_count: Optional[int] = None
     external_intervention_policy: Literal["pause", "continue_reconcile", "emergency_stop"] = "pause"
     stop_policy: Literal["cancel_orders_only", "cancel_orders_and_optionally_liquidate_base"] = "cancel_orders_only"
+
+    @model_validator(mode="after")
+    def resolve_order_quote_value(self) -> "BotConfig":
+        """
+        Ha order_quote_value nincs megadva: automatikusan kiszámolja.
+        Ha meg van adva: validálja a konzisztenciát.
+        """
+        available = self.total_capital_quote * (1 - self.quote_reserve_pct)
+
+        if self.order_quote_value is None:
+            # Automatikus számítás: tőke elosztva a szintekre, 2 tizedesre kerekítve
+            self.order_quote_value = (available / self.max_grid_levels).quantize(Decimal("0.01"))
+        else:
+            if self.order_quote_value <= 0:
+                raise ValueError("order_quote_value pozitív kell legyen")
+            if self.order_quote_value > available:
+                raise ValueError(
+                    f"order_quote_value ({self.order_quote_value} USDT) meghaladja az elérhető "
+                    f"tőkét ({available} USDT = {self.total_capital_quote} - {self.quote_reserve_pct*100}% tartalék). "
+                    f"Csökkentsd order_quote_value-t vagy növeld total_capital_quote-t."
+                )
+            max_single = available / 2
+            if self.order_quote_value > max_single:
+                raise ValueError(
+                    f"order_quote_value ({self.order_quote_value} USDT) túl nagy – "
+                    f"legalább 2 grid szinthez elegendő tőke kell. "
+                    f"Maximum: {max_single} USDT."
+                )
+        return self
+
+
+class BootstrapConfig(BaseModel):
+    """
+    quote_only_bootstrap mód beállításai.
+    Ha inventory_mode = quote_only_bootstrap: a bot először SOL-t vásárol,
+    majd utána helyezi el a sell order-eket.
+    """
+    order_type: Literal["MARKET", "LIMIT", "LIMIT_MAKER"] = "MARKET"
+    # MARKET: azonnali végrehajtás piaci áron (taker díj!)
+    # LIMIT:  limit áron, offset-tel az anchor alá
+    # LIMIT_MAKER: post-only, csak akkor tölt ha maker (lassabb de olcsóbb)
+
+    quote_qty: Optional[Decimal] = None
+    # Mennyi USDT-ért vásárol SOL-t a bootstrap lépésben.
+    # None = automatikus: total_capital_quote × buy_allocation_ratio
+    # Pl. 50 USDT tőke, 0.5 arány → 25 USDT-ért vesz SOL-t
+
+    limit_price_offset_pct: Decimal = Decimal("0.001")
+    # LIMIT/LIMIT_MAKER bootstrap esetén: az anchor ár alá annyival
+    # Pl. 0.001 = 0.1%-kal az aktuális ár alatt ad le LIMIT ordert
 
 
 class FeeConfig(BaseModel):
@@ -83,7 +147,7 @@ class FeeConfig(BaseModel):
 
 
 class AnchorConfig(BaseModel):
-    source: Literal["manual", "best_bid_ask_mid", "last_trade"] = "manual"
+    source: Literal["manual", "best_bid_ask_mid", "last_trade"] = "best_bid_ask_mid"
     manual_price: Optional[Decimal] = None
 
 
@@ -116,7 +180,6 @@ class DatabaseConfig(BaseModel):
 
     @property
     def dsn_asyncpg(self) -> str:
-        """DSN asyncpg közvetlen használathoz (SQLAlchemy nélkül)."""
         password = os.environ.get(self.password_env, "")
         return f"postgresql://{self.user}:{password}@{self.host}:{self.port}/{self.name}"
 
@@ -129,6 +192,7 @@ class LoggingConfig(BaseModel):
 class Settings(BaseModel):
     exchange: ExchangeConfig = ExchangeConfig()
     bot: BotConfig = BotConfig()
+    bootstrap: BootstrapConfig = BootstrapConfig()
     fees: FeeConfig = FeeConfig()
     anchor: AnchorConfig = AnchorConfig()
     safety: SafetyConfig = SafetyConfig()
@@ -136,9 +200,11 @@ class Settings(BaseModel):
     logging: LoggingConfig = LoggingConfig()
 
     @model_validator(mode="after")
-    def validate_anchor(self) -> "Settings":
+    def validate_settings(self) -> "Settings":
         if self.anchor.source == "manual" and self.anchor.manual_price is None:
             raise ValueError("anchor.manual_price szükséges, ha source=manual")
+        if self.bot.inventory_mode != "quote_only_bootstrap" and self.bootstrap.quote_qty is not None:
+            pass  # figyelmen kívül hagyjuk ha nem bootstrap mód
         return self
 
 
