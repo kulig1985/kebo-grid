@@ -55,11 +55,13 @@ safety:
   sell_on_emergency_stop: false
 
 database:
-  host: localhost
-  port: 5432
+  # ⚠ Ide a TÉNYLEGES értékeket kell írni, NEM az env var nevét!
+  # Az env var-ok (DB_HOST, DB_PORT, DB_NAME, DB_USER) FELÜLÍRJÁK ezeket ha be vannak állítva.
+  host: localhost           # vagy: 95.138.193.102 – a DB szerver IP-je
+  port: 5432                # egész szám, nem string, nem "DB_PORT"!
   name: kebo_db
   user: kebo_grid
-  password_env: DATABASE_PASSWORD
+  password_env: DATABASE_PASSWORD   # ← ez az egyetlen env var NÉV itt, a többi tényleges érték
   pool_min_size: 1
   pool_max_size: 10
   writer_queue_max_size: 10000

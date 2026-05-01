@@ -164,24 +164,45 @@ class SafetyConfig(BaseModel):
 
 
 class DatabaseConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 5432
-    name: str = "kebo_db"
-    user: str = "kebo_grid"
+    host: str = "localhost"     # felülírható: DB_HOST env var
+    port: int = 5432            # felülírható: DB_PORT env var
+    name: str = "kebo_db"      # felülírható: DB_NAME env var
+    user: str = "kebo_grid"    # felülírható: DB_USER env var
     password_env: str = "DATABASE_PASSWORD"
     pool_min_size: int = 1
     pool_max_size: int = 10
     writer_queue_max_size: int = 10000
 
     @property
+    def resolved_host(self) -> str:
+        """DB_HOST env var felülírja a YAML értéket, ha be van állítva."""
+        return os.environ.get("DB_HOST", self.host)
+
+    @property
+    def resolved_port(self) -> int:
+        """DB_PORT env var felülírja a YAML értéket, ha be van állítva."""
+        val = os.environ.get("DB_PORT")
+        return int(val) if val else self.port
+
+    @property
+    def resolved_name(self) -> str:
+        return os.environ.get("DB_NAME", self.name)
+
+    @property
+    def resolved_user(self) -> str:
+        return os.environ.get("DB_USER", self.user)
+
+    @property
     def dsn(self) -> str:
         password = os.environ.get(self.password_env, "")
-        return f"postgresql+asyncpg://{self.user}:{password}@{self.host}:{self.port}/{self.name}"
+        return (f"postgresql+asyncpg://{self.resolved_user}:{password}"
+                f"@{self.resolved_host}:{self.resolved_port}/{self.resolved_name}")
 
     @property
     def dsn_asyncpg(self) -> str:
         password = os.environ.get(self.password_env, "")
-        return f"postgresql://{self.user}:{password}@{self.host}:{self.port}/{self.name}"
+        return (f"postgresql://{self.resolved_user}:{password}"
+                f"@{self.resolved_host}:{self.resolved_port}/{self.resolved_name}")
 
 
 class LoggingConfig(BaseModel):
