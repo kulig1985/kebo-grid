@@ -148,7 +148,18 @@ class GridCalculator:
 
             result = validate_order(price, qty, symbol_info)
             if not result.valid:
-                # Ha nem teljesül, leállítjuk itt a szint generálást
+                if i == 1:
+                    # Az első szint is bukik → order_quote_value túl kicsi
+                    from app.log_setup import get_logger
+                    log = get_logger(__name__)
+                    log.error(
+                        "BUY szint 1 érvénytelen – order_quote_value túl kicsi! "
+                        "Növeld order_quote_value-t (min_notional felett kell legyen).",
+                        price=str(price), qty=str(qty), notional=str(qty * price),
+                        errors=result.errors,
+                        min_notional=str(symbol_info.notional.min_notional),
+                        current_order_value=str(order_quote_value),
+                    )
                 break
 
             buy_levels.append(GridLevel(

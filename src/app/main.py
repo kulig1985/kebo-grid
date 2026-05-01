@@ -310,6 +310,7 @@ async def main() -> None:
         on_reconnect=lambda: asyncio.get_event_loop().create_task(
             log.ainfo("User stream reconnect – reconciliation szükséges")
         ),
+        ws_api=ws_api,  # WS API fallback ha REST /api/v3/userDataStream nem elérhető
     )
     market_stream = MarketStream(settings.exchange, settings.bot.symbol)
     engine = GridEngine(settings, ws_api, db_queue, event_queue, market_stream=market_stream)

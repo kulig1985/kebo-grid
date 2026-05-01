@@ -284,6 +284,34 @@ class BinanceWsApi:
 
     # --- Query metódusok (várakozással) ---
 
+    async def get_listen_key(self) -> str:
+        """listenKey lekérése WS API-n keresztül (REST fallback helyett)."""
+        result = await self._query_apikey_only("userDataStream.start", {})
+        return result["listenKey"]
+
+    async def keepalive_listen_key(self, listen_key: str) -> None:
+        """listenKey megújítása WS API-n keresztül."""
+        await self._query_apikey_only("userDataStream.ping", {"listenKey": listen_key})
+
+    async def _query_apikey_only(self, method: str, params: dict) -> Any:
+        """WS API hívás csak apiKey-jel (timestamp és signature nélkül)."""
+        await self._connected.wait()
+        request_id = str(uuid.uuid4())
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
+        cmd = WsSendCommand(
+            request_id=request_id,
+            method=method,
+            params={**params, "apiKey": self.config.api_key},
+            is_authenticated=False,
+        )
+        self.send_queue.put_nowait(cmd)
+        try:
+            return await asyncio.wait_for(future, timeout=10.0)
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            raise TimeoutError(f"WS API timeout: {method}")
+
     async def get_exchange_info(self, symbol: str) -> dict:
         return await self._query("exchangeInfo", {"symbol": symbol}, authenticated=False)
 

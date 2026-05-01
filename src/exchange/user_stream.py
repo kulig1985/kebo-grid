@@ -30,6 +30,9 @@ class UserDataStream:
     """
     Binance User Data Stream olvasó.
 
+    listenKey megszerzése: először REST-en próbálja, ha az nem elérhető (pl. 410),
+    akkor WS API-n keresztül (userDataStream.start metódus).
+
     Minden bejövő esemény azonnal az event_queue-ba kerül.
     A WebSocket olvasó loop-ban NINCS DB írás.
     """
@@ -39,14 +42,17 @@ class UserDataStream:
         config: ExchangeConfig,
         event_queue: asyncio.Queue,
         on_reconnect: Optional[Callable] = None,
+        ws_api=None,  # BinanceWsApi – WS API fallback a listenKey-hez
     ):
         self.config = config
         self.event_queue = event_queue
-        self.on_reconnect = on_reconnect  # hívható, ha reconnect történik
+        self.on_reconnect = on_reconnect
+        self.ws_api = ws_api
         self._listen_key: Optional[str] = None
         self._running = False
         self._reconnect_count = 0
         self._last_event_time = 0.0
+        self._connected_once = False  # watchdog check-hez
         self._http_session: Optional[aiohttp.ClientSession] = None
 
     async def start(self) -> None:
@@ -86,26 +92,50 @@ class UserDataStream:
         self._running = False
 
     async def _obtain_listen_key(self) -> None:
-        """listenKey lekérése REST-en (egyetlen REST hívás a rendszerben)."""
-        url = f"{self.config.rest_url}/api/v3/userDataStream"
-        headers = {"X-MBX-APIKEY": self.config.api_key}
-        async with self._http_session.post(url, headers=headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            self._listen_key = data["listenKey"]
-            log.info("listenKey megszerzve")
+        """
+        listenKey lekérése: REST-en próbálja először, ha az nem elérhető,
+        WS API-n keresztül (userDataStream.start).
+        """
+        # 1. REST próbálkozás
+        try:
+            url = f"{self.config.rest_url}/api/v3/userDataStream"
+            headers = {"X-MBX-APIKEY": self.config.api_key}
+            async with self._http_session.post(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._listen_key = data["listenKey"]
+                    log.info("listenKey megszerzve (REST)")
+                    return
+                else:
+                    body = await resp.text()
+                    log.warning("REST listenKey sikertelen, WS API fallback...",
+                                status=resp.status, body=body[:200])
+        except Exception as e:
+            log.warning("REST listenKey hiba, WS API fallback...", error=str(e))
+
+        # 2. WS API fallback
+        if self.ws_api is None:
+            raise RuntimeError("REST userDataStream 410/error és nincs WS API fallback!")
+        self._listen_key = await self.ws_api.get_listen_key()
+        log.info("listenKey megszerzve (WS API fallback)")
 
     async def _keepalive_loop(self) -> None:
         """30 percenként megújítja a listenKey-t."""
         while self._running and self._listen_key:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             try:
+                # REST próbálkozás
                 url = f"{self.config.rest_url}/api/v3/userDataStream"
                 headers = {"X-MBX-APIKEY": self.config.api_key}
                 params = {"listenKey": self._listen_key}
                 async with self._http_session.put(url, headers=headers, params=params) as resp:
-                    resp.raise_for_status()
-                    log.info("listenKey megújítva")
+                    if resp.status == 200:
+                        log.info("listenKey megújítva (REST)")
+                        continue
+                    # REST hiba → WS API fallback
+                if self.ws_api:
+                    await self.ws_api.keepalive_listen_key(self._listen_key)
+                    log.info("listenKey megújítva (WS API)")
             except Exception as e:
                 log.error("listenKey megújítás sikertelen", error=str(e))
 
@@ -120,6 +150,7 @@ class UserDataStream:
             ping_timeout=60,
         ) as ws:
             log.info("User stream csatlakozva")
+            self._connected_once = True
             async for message in ws:
                 self._last_event_time = time.monotonic()
                 try:
