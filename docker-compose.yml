@@ -2,6 +2,8 @@ x-bot-common: &bot-common
   build: .
   restart: unless-stopped
   env_file: .env
+  networks:
+    - kebo-net
   healthcheck:
     test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
     interval: 30s
@@ -11,14 +13,23 @@ x-bot-common: &bot-common
 
 services:
 
-  # SOLUSDT bot – API: http://localhost:8081
-  bot-solusdt:
+  # SOLUSDC bot – API: http://localhost:4080
+  bot-solusdc:
     <<: *bot-common
-    container_name: kebo-grid-solusdt
+    container_name: kebo-grid-solusdc
     ports:
-      - "8081:8080"
+      - "4080:8080"
     volumes:
-      - ./configs/solusdt.yaml:/app/config.yaml:ro
+      - ./configs/solusdc.yaml:/app/config.yaml:ro
+
+  # SOLUSDT bot – API: http://localhost:8081
+  # bot-solusdt:
+  #   <<: *bot-common
+  #   container_name: kebo-grid-solusdt
+  #   ports:
+  #     - "8081:8080"
+  #   volumes:
+  #     - ./configs/solusdt.yaml:/app/config.yaml:ro
 
   # BTCUSDT bot – API: http://localhost:8082
   # bot-btcusdt:
@@ -29,19 +40,28 @@ services:
   #   volumes:
   #     - ./configs/btcusdt.yaml:/app/config.yaml:ro
 
-  # ETHUSDT bot – API: http://localhost:8083
-  # bot-ethusdt:
-  #   <<: *bot-common
-  #   container_name: kebo-grid-ethusdt
-  #   ports:
-  #     - "8083:8080"
-  #   volumes:
-  #     - ./configs/ethusdt.yaml:/app/config.yaml:ro
+networks:
+  kebo-net:
+    name: kebo-net
+    driver: bridge
 
-# MEGJEGYZÉS:
-# - Minden bot saját config YAML-t kap (./configs/<symbol>.yaml)
-# - Sablonok: configs/<symbol>.example.yaml → másold le és töltsd ki
-#   pl.: cp configs/solusdt.example.yaml configs/solusdt.yaml
-# - Az API kulcsok és DB jelszó közös .env fájlból jön (.env.example alapján)
-# - Új pár: komment eltávolítás + configs/<symbol>.yaml létrehozása
-# - Port: 8081 (SOL), 8082 (BTC), 8083 (ETH), stb.
+# ============================================================
+# DB KAPCSOLAT – Docker hálózati útmutató:
+#
+# A bot Docker konténerből NEM éri el a 95.138.193.102 külső IP-t
+# (hairpin NAT probléma ugyanazon a VPS-en).
+#
+# MEGOLDÁS A – DB ugyanazon a VPS-en Docker konténerben fut:
+#   1. Csatlakoztasd a DB konténert a kebo-net hálózathoz:
+#      docker network connect kebo-net <db-container-neve>
+#   2. .env-ben: DB_HOST=<db-container-neve>
+#      pl.: DB_HOST=postgres  vagy  DB_HOST=my-postgres
+#
+# MEGOLDÁS B – DB direktben fut a VPS-en (nem Docker):
+#   .env-ben: DB_HOST=172.17.0.1
+#   (172.17.0.1 a Docker bridge gateway = a host gép IP-je konténerekből)
+#
+# MEGOLDÁS C – DB külső szerveren van (nem ugyanazon a VPS-en):
+#   .env-ben: DB_HOST=<db-szerver-külső-ip>
+#   Ez működik, mert más hálózatról jön a csatlakozás.
+# ============================================================

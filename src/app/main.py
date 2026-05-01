@@ -258,8 +258,17 @@ async def run_migrations() -> None:
     log.info("Adatbázis migrációk futtatása...")
     alembic_cfg = AlembicConfig("alembic.ini")
     loop = asyncio.get_event_loop()
-    # Az Alembic sync – executor-ban futtatjuk, hogy ne blokkoljon
-    await loop.run_in_executor(None, lambda: alembic_command.upgrade(alembic_cfg, "head"))
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: alembic_command.upgrade(alembic_cfg, "head")),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            "DB migráció timeout (30s)! Ellenőrizd a DB kapcsolatot.\n"
+            "Docker konténerből NEM éred el a VPS külső IP-jét (hairpin NAT).\n"
+            "Megoldás: lásd docker-compose.yml kommenteket (kebo-net hálózat)."
+        )
     log.info("Adatbázis migrációk kész")
 
 
