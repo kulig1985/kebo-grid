@@ -66,4 +66,4 @@ database:
 
 logging:
   level: INFO
-  json: true
+  json_format: true

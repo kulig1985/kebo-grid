@@ -186,7 +186,7 @@ class DatabaseConfig(BaseModel):
 
 class LoggingConfig(BaseModel):
     level: str = "INFO"
-    json: bool = True
+    json_format: bool = True  # json volt, de ütközött a Pydantic BaseModel.json() metódusával
 
 
 class Settings(BaseModel):

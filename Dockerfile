@@ -16,8 +16,9 @@ COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 
-# Konfig (YAML-t a felhasználó mountolja)
-# Érzékeny adatok MINDIG env var-ból!
+# Üres config.yaml fájl létrehozása – kötelező, hogy Docker fájlként mountolhassa!
+# (Ha ez hiányzik, Docker könyvtárat csinál belőle és mount sikertelen.)
+RUN touch /app/config.yaml
 
 ENV PYTHONPATH=/app/src
 ENV PYTHONUNBUFFERED=1

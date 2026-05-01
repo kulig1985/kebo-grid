@@ -268,7 +268,7 @@ async def main() -> None:
     config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     settings = load_config(config_file)
 
-    setup_logging(settings.logging.level, settings.logging.json)
+    setup_logging(settings.logging.level, settings.logging.json_format)
     log.info("Kebo Grid Bot indul", config=config_file)
 
     # DB inicializálás + auto migráció

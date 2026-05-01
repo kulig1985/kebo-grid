@@ -143,4 +143,4 @@ database:
 
 logging:
   level: INFO     # DEBUG | INFO | WARNING | ERROR
-  json: true      # true: JSON (Docker/log aggregátor); false: olvasható szöveg
+  json_format: true      # true: JSON (Docker/log aggregátor); false: olvasható szöveg
