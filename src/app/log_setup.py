@@ -1,6 +1,12 @@
 """Strukturált naplózás beállítása (structlog)."""
+import json
 import logging
 import structlog
+
+
+def _json_serializer(obj, **kwargs) -> str:
+    """JSON szerializáló, ami olvasható karaktereket ír (nem \\uXXXX escape)."""
+    return json.dumps(obj, ensure_ascii=False, default=str)
 
 
 def setup_logging(level: str = "INFO", json_output: bool = True) -> None:
@@ -18,7 +24,8 @@ def setup_logging(level: str = "INFO", json_output: bool = True) -> None:
     ]
 
     if json_output:
-        processors.append(structlog.processors.JSONRenderer())
+        # ensure_ascii=False: ékezetes karakterek olvashatóak maradnak a logban
+        processors.append(structlog.processors.JSONRenderer(serializer=_json_serializer))
     else:
         processors.append(structlog.dev.ConsoleRenderer())
 

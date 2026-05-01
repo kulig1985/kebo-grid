@@ -111,6 +111,7 @@ class UserDataStream:
         ) as ws:
             log.info("User stream csatlakozva")
             self._connected_once = True
+            self._last_event_time = time.monotonic()  # grace period: 10s az első eseményig
             async for message in ws:
                 self._last_event_time = time.monotonic()
                 try:

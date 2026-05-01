@@ -120,6 +120,20 @@ class GridEngine:
         self.symbol_info = SymbolInfo.from_exchange_info(sym_data)
         log.info("exchangeInfo betöltve", symbol=symbol)
 
+        # exchangeInfo alapján order_quote_value validálás és auto-igazítás
+        min_notional = self.symbol_info.notional.min_notional
+        bot_cfg = self.settings.bot
+        if bot_cfg.order_quote_value < min_notional:
+            adjusted = (min_notional * Decimal("1.2")).quantize(Decimal("0.01"))
+            log.warning(
+                "order_quote_value kisebb mint a Binance min_notional – auto-igazítva!",
+                order_quote_value=str(bot_cfg.order_quote_value),
+                min_notional=str(min_notional),
+                adjusted_to=str(adjusted),
+                hint=f"Állítsd be a config-ban: order_quote_value: \"{adjusted}\"",
+            )
+            bot_cfg.order_quote_value = adjusted
+
         # 2. Account + inventory
         account_data = await self.ws_api.get_account()
         self.inventory.update_from_account(account_data.get("balances", []))
@@ -174,6 +188,16 @@ class GridEngine:
             self.grid_plan = self.calculator.generate_arithmetic_grid(
                 anchor_price, step, k_buy, k_sell,
                 bot.order_quote_value, self.symbol_info,
+            )
+
+        if self.grid_plan.k_buy == 0 and self.grid_plan.k_sell == 0:
+            raise ValueError(
+                f"Grid generálás sikertelen: 0 érvényes szint. "
+                f"Lehetséges okok: order_quote_value ({bot.order_quote_value}) < min_notional, "
+                f"vagy nincs elég tőke. "
+                f"Ajánlott order_quote_value: {self.symbol_info.notional.min_notional * Decimal('1.2'):.2f} USDC, "
+                f"total_capital_quote legalább: "
+                f"{self.symbol_info.notional.min_notional * Decimal('1.2') * 2:.2f} USDC."
             )
 
         log.info(
