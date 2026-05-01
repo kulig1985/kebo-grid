@@ -1,10 +1,12 @@
 """
 Binance User Data Stream kliens.
 
+listenKey kezelés KIZÁRÓLAG WS API-n keresztül (userDataStream.start / ping).
+NINCS REST hívás ebben a modulban.
+
 Felelős:
-- listenKey kezelés (REST, ez az egyetlen REST hívás a rendszerben)
-- executionReport, outboundAccountPosition, balanceUpdate eventi olvasás
-- Automatikus újracsatlakozás és RECONCILING állapot jelzés
+- executionReport, outboundAccountPosition, balanceUpdate esemény olvasás
+- Automatikus újracsatlakozás
 """
 import asyncio
 import json
@@ -12,9 +14,7 @@ import random
 import time
 from typing import Callable, Optional
 
-import aiohttp
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 from app.config import ExchangeConfig
 from app.log_setup import get_logger
@@ -30,11 +30,8 @@ class UserDataStream:
     """
     Binance User Data Stream olvasó.
 
-    listenKey megszerzése: először REST-en próbálja, ha az nem elérhető (pl. 410),
-    akkor WS API-n keresztül (userDataStream.start metódus).
-
-    Minden bejövő esemény azonnal az event_queue-ba kerül.
-    A WebSocket olvasó loop-ban NINCS DB írás.
+    listenKey kizárólag WS API-n keresztül (ws_api.get_listen_key()).
+    NINCS REST hívás.
     """
 
     def __init__(
@@ -42,7 +39,7 @@ class UserDataStream:
         config: ExchangeConfig,
         event_queue: asyncio.Queue,
         on_reconnect: Optional[Callable] = None,
-        ws_api=None,  # BinanceWsApi – WS API fallback a listenKey-hez
+        ws_api=None,  # BinanceWsApi – kötelező a listenKey WS API-hoz
     ):
         self.config = config
         self.event_queue = event_queue
@@ -52,90 +49,53 @@ class UserDataStream:
         self._running = False
         self._reconnect_count = 0
         self._last_event_time = 0.0
-        self._connected_once = False  # watchdog check-hez
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._connected_once = False
 
     async def start(self) -> None:
         """Fő reader loop elindítása."""
         self._running = True
-        self._http_session = aiohttp.ClientSession()
 
-        try:
-            delay = RECONNECT_BASE_DELAY
-            while self._running:
-                try:
-                    await self._obtain_listen_key()
-                    await asyncio.gather(
-                        self._reader_loop(),
-                        self._keepalive_loop(),
-                        return_exceptions=True,
-                    )
-                except Exception as e:
-                    log.error("User stream hiba", error=str(e))
+        delay = RECONNECT_BASE_DELAY
+        while self._running:
+            try:
+                await self._obtain_listen_key()
+                await asyncio.gather(
+                    self._reader_loop(),
+                    self._keepalive_loop(),
+                    return_exceptions=True,
+                )
+            except Exception as e:
+                log.error("User stream hiba", error=str(e))
 
-                if not self._running:
-                    break
+            if not self._running:
+                break
 
-                jitter = random.uniform(0, delay * 0.3)
-                await asyncio.sleep(delay + jitter)
-                delay = min(delay * 2, RECONNECT_MAX_DELAY)
-                self._reconnect_count += 1
-                log.info("User stream újracsatlakozás", attempt=self._reconnect_count)
+            jitter = random.uniform(0, delay * 0.3)
+            await asyncio.sleep(delay + jitter)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY)
+            self._reconnect_count += 1
+            log.info("User stream újracsatlakozás", attempt=self._reconnect_count)
 
-                if self.on_reconnect:
-                    asyncio.get_event_loop().call_soon(self.on_reconnect)
-        finally:
-            if self._http_session:
-                await self._http_session.close()
+            if self.on_reconnect:
+                asyncio.get_event_loop().call_soon(self.on_reconnect)
 
     async def stop(self) -> None:
         self._running = False
 
     async def _obtain_listen_key(self) -> None:
-        """
-        listenKey lekérése: REST-en próbálja először, ha az nem elérhető,
-        WS API-n keresztül (userDataStream.start).
-        """
-        # 1. REST próbálkozás
-        try:
-            url = f"{self.config.rest_url}/api/v3/userDataStream"
-            headers = {"X-MBX-APIKEY": self.config.api_key}
-            async with self._http_session.post(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    self._listen_key = data["listenKey"]
-                    log.info("listenKey megszerzve (REST)")
-                    return
-                else:
-                    body = await resp.text()
-                    log.warning("REST listenKey sikertelen, WS API fallback...",
-                                status=resp.status, body=body[:200])
-        except Exception as e:
-            log.warning("REST listenKey hiba, WS API fallback...", error=str(e))
-
-        # 2. WS API fallback
+        """listenKey lekérése WS API-n (userDataStream.start) – NEM REST."""
         if self.ws_api is None:
-            raise RuntimeError("REST userDataStream 410/error és nincs WS API fallback!")
+            raise RuntimeError("ws_api kötelező a listenKey megszerzéséhez!")
         self._listen_key = await self.ws_api.get_listen_key()
-        log.info("listenKey megszerzve (WS API fallback)")
+        log.info("listenKey megszerzve (WS API)")
 
     async def _keepalive_loop(self) -> None:
-        """30 percenként megújítja a listenKey-t."""
+        """30 percenként megújítja a listenKey-t WS API-n (NEM REST)."""
         while self._running and self._listen_key:
             await asyncio.sleep(KEEPALIVE_INTERVAL)
             try:
-                # REST próbálkozás
-                url = f"{self.config.rest_url}/api/v3/userDataStream"
-                headers = {"X-MBX-APIKEY": self.config.api_key}
-                params = {"listenKey": self._listen_key}
-                async with self._http_session.put(url, headers=headers, params=params) as resp:
-                    if resp.status == 200:
-                        log.info("listenKey megújítva (REST)")
-                        continue
-                    # REST hiba → WS API fallback
-                if self.ws_api:
-                    await self.ws_api.keepalive_listen_key(self._listen_key)
-                    log.info("listenKey megújítva (WS API)")
+                await self.ws_api.keepalive_listen_key(self._listen_key)
+                log.info("listenKey megújítva (WS API)")
             except Exception as e:
                 log.error("listenKey megújítás sikertelen", error=str(e))
 
@@ -172,7 +132,3 @@ class UserDataStream:
         if self._last_event_time == 0:
             return float("inf")
         return time.monotonic() - self._last_event_time
-
-    @property
-    def is_stale(self, max_staleness_sec: float = 10.0) -> bool:
-        return self.last_event_age_sec > max_staleness_sec

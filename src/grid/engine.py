@@ -95,6 +95,21 @@ class GridEngine:
 
         log.info("Grid engine inicializálás", bot_run_id=bot_run_id)
 
+        # 0. Szerver idő szinkronizálás WS API-n keresztül (NEM REST)
+        try:
+            result = await self.ws_api._query("time", {}, authenticated=False)
+            server_ms = result["serverTime"]
+            local_ms = int(__import__("time").time() * 1000)
+            offset = server_ms - local_ms
+            from exchange.signing import set_time_offset
+            set_time_offset(offset)
+            if abs(offset) > 1000:
+                log.warning("Rendszeróra eltérés korrigálva", offset_ms=offset)
+            else:
+                log.info("Szerver idő szinkronizálva", offset_ms=offset)
+        except Exception as e:
+            log.warning("Szerver idő szinkron sikertelen", error=str(e))
+
         # 1. exchangeInfo
         symbol = self.settings.bot.symbol
         info_data = await self.ws_api.get_exchange_info(symbol)

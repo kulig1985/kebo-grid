@@ -280,16 +280,8 @@ async def main() -> None:
     setup_logging(settings.logging.level, settings.logging.json_format)
     log.info("Kebo Grid Bot indul", config=config_file)
 
-    # Binance server time szinkron HTTP-en (a WS előtt, szinkron módon)
-    from exchange.signing import sync_time_with_binance
-    offset = sync_time_with_binance(settings.exchange.rest_url)
-    if abs(offset) > 1000:
-        log.warning("Rendszeróra eltérés", offset_ms=offset,
-                    hint="sudo ntpdate pool.ntp.org")
-    else:
-        log.info("Idő szinkronizálva", offset_ms=offset)
-
     # DB inicializálás + auto migráció
+    # (Időszinkron a WS kapcsolat felépülése után történik a ws_api.writer_loop()-ban)
     init_db(settings.database)
     await run_migrations()
 
