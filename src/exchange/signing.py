@@ -1,17 +1,37 @@
 """Binance WebSocket API HMAC-SHA256 aláírás + clock drift kezelés."""
 import hashlib
 import hmac
+import json
 import time
 import urllib.parse
+import urllib.request
 from decimal import Decimal
 
-# Globális időeltérés Binance szerverhez képest (milliszekundumban).
-# Pozitív = a mi óránk siet, negatív = késik.
 _time_offset_ms: int = 0
 
 
+def sync_time_with_binance(rest_url: str = "https://api.binance.com") -> int:
+    """
+    Binance server time lekérése HTTP-en (szinkron, startup-kor hívandó).
+    Beállítja a globális clock offset-et.
+    Visszaadja az offset értékét ms-ban.
+    """
+    global _time_offset_ms
+    try:
+        url = f"{rest_url}/api/v3/time"
+        req = urllib.request.Request(url, headers={"User-Agent": "kebo-grid/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+        server_ms = data["serverTime"]
+        local_ms = int(time.time() * 1000)
+        _time_offset_ms = server_ms - local_ms
+        return _time_offset_ms
+    except Exception as e:
+        # Ha nem sikerül, nem blokkoljuk az indítást
+        return 0
+
+
 def set_time_offset(offset_ms: int) -> None:
-    """Beállítja a clock drift korrekciót Binance server time alapján."""
     global _time_offset_ms
     _time_offset_ms = offset_ms
 

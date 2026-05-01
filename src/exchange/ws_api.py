@@ -22,7 +22,7 @@ from websockets.exceptions import ConnectionClosed
 
 from app.config import ExchangeConfig
 from app.log_setup import get_logger
-from .signing import sign_params, make_timestamp, set_time_offset
+from .signing import sign_params, make_timestamp
 
 log = get_logger(__name__)
 
@@ -131,8 +131,6 @@ class BinanceWsApi:
         self._connect_time = time.monotonic()
         self._connected.set()
         log.info("WS API csatlakozva")
-        # Csatlakozás után szinkronizáljuk az időt a Binance szerverrel
-        await self._sync_server_time()
 
     async def _write_loop(self) -> None:
         while self._running and self._ws is not None:
@@ -192,14 +190,17 @@ class BinanceWsApi:
         if status and status != 200:
             error = data.get("error", {})
             log.warning("WS API order hiba (telemetria)", status=status, error=error, id=request_id)
-            # DB-be mentjük a submission error-t
-            self.db_queue.put_nowait({"type": "log_system_event", "data": {
-                "severity": "WARNING",
-                "component": "ws_api",
-                "event_type": "order_submission_error",
-                "message": f"WS API hiba: {error.get('msg', 'ismeretlen')}",
-                "payload": {"request_id": request_id, "error": error, "status": status},
-            }})
+            from persistence.writer import DbEvent
+            self.db_queue.put_nowait(DbEvent(
+                type="log_system_event",
+                data={
+                    "severity": "WARNING",
+                    "component": "ws_api",
+                    "event_type": "order_submission_error",
+                    "message": f"WS API hiba: {error.get('msg', 'ismeretlen')}",
+                    "payload": {"request_id": request_id, "error": error, "status": status},
+                },
+            ))
 
     async def _query(self, method: str, params: dict, authenticated: bool = True) -> Any:
         """Query hívás – vár a válaszra (csak nem-kereskedési hívásokhoz)."""
@@ -280,22 +281,6 @@ class BinanceWsApi:
         )
         self.send_queue.put_nowait(cmd)
         return request_id
-
-    async def _sync_server_time(self) -> None:
-        """Binance server time lekérése és clock drift korrekció beállítása."""
-        try:
-            result = await self._query("time", {}, authenticated=False)
-            server_time_ms = result["serverTime"]
-            local_time_ms = int(time.time() * 1000)
-            offset = server_time_ms - local_time_ms
-            set_time_offset(offset)
-            if abs(offset) > 1000:
-                log.warning("Rendszeróra eltérés detektálva", offset_ms=offset,
-                            hint="Futtasd: sudo timedatectl set-ntp true")
-            else:
-                log.info("Szerver idő szinkronizálva", offset_ms=offset)
-        except Exception as e:
-            log.warning("Szerver idő szinkron sikertelen, alapértelmezett offset használata", error=str(e))
 
     # --- Query metódusok (várakozással) ---
 
