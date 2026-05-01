@@ -14,6 +14,7 @@ from typing import Optional
 
 from app.config import Settings
 from app.logging import get_logger
+from exchange.market_stream import MarketStream
 from exchange.models import ExecutionReport, SymbolInfo
 from exchange.ws_api import BinanceWsApi
 from grid.calculator import GridCalculator, GridLevel, GridPlan
@@ -51,11 +52,13 @@ class GridEngine:
         ws_api: BinanceWsApi,
         db_queue: asyncio.Queue[DbEvent],
         event_queue: asyncio.Queue,
+        market_stream: Optional[MarketStream] = None,
     ):
         self.settings = settings
         self.ws_api = ws_api
         self.db_queue = db_queue
         self.event_queue = event_queue
+        self.market_stream = market_stream
 
         self.bot_run_id: Optional[int] = None
         self._bot_run_short_id: str = ""
@@ -172,11 +175,31 @@ class GridEngine:
         await self._place_initial_orders()
 
     async def _determine_anchor_price(self) -> Decimal:
-        """Anchor price meghatározás konfig szerint."""
+        """
+        Anchor price meghatározás konfig szerint.
+
+        - manual: a konfig fájlban megadott ár
+        - best_bid_ask_mid: legjobb bid/ask közép (market stream bookTicker)
+        - last_trade: utolsó kereskedési ár (market stream bookTicker mid)
+        """
         src = self.settings.anchor.source
+
         if src == "manual":
+            if self.settings.anchor.manual_price is None:
+                raise ValueError("anchor.manual_price kötelező ha source=manual")
             return self.settings.anchor.manual_price
-        raise NotImplementedError(f"Anchor source '{src}' nem implementált (market stream kell)")
+
+        if src in ("best_bid_ask_mid", "last_trade"):
+            if self.market_stream is None:
+                raise ValueError(
+                    f"anchor.source='{src}' esetén market_stream szükséges. "
+                    "Ellenőrizd a main.py-t."
+                )
+            price = await self.market_stream.wait_for_price(timeout=15.0)
+            log.info("Anchor price live market adatból", source=src, price=str(price))
+            return price
+
+        raise ValueError(f"Ismeretlen anchor.source: '{src}'")
 
     async def _place_initial_orders(self) -> None:
         """

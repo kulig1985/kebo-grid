@@ -40,6 +40,8 @@ services:
 
 # MEGJEGYZÉS:
 # - Minden bot saját config YAML-t kap (./configs/<symbol>.yaml)
-# - Az API kulcsok és DB jelszó közös .env fájlból jön
-# - Új pár hozzáadásához: komment eltávolítás + configs/<symbol>.yaml létrehozása
+# - Sablonok: configs/<symbol>.example.yaml → másold le és töltsd ki
+#   pl.: cp configs/solusdt.example.yaml configs/solusdt.yaml
+# - Az API kulcsok és DB jelszó közös .env fájlból jön (.env.example alapján)
+# - Új pár: komment eltávolítás + configs/<symbol>.yaml létrehozása
 # - Port: 8081 (SOL), 8082 (BTC), 8083 (ETH), stb.

@@ -4,6 +4,7 @@
 !.env.example
 config.yaml
 configs/*.yaml
+!configs/*.example.yaml
 
 # Claude Code belső mappa
 .claude/

@@ -27,6 +27,7 @@ from fastapi import FastAPI
 
 from app.config import Settings, load_config
 from app.logging import get_logger, setup_logging
+from exchange.market_stream import MarketStream
 from exchange.models import ExecutionReport
 from exchange.user_stream import UserDataStream
 from exchange.ws_api import BinanceWsApi, WsSendCommand
@@ -88,18 +89,20 @@ async def event_dispatcher(
                 await _handle_execution_report(data, db_queue, engine, bot_run_id, local_cancels)
 
             elif event_type == "outboundAccountPosition":
-                engine.inventory.update_from_account_position(data.get("B", []))
-                db_queue.put_nowait(DbEvent(
-                    type="update_balance",
-                    data={
-                        "bot_run_id": bot_run_id,
-                        "asset": b["a"],
-                        "free": Decimal(b["f"]),
-                        "locked": Decimal(b["l"]),
-                        "source": "user_stream",
-                        "event_time": data.get("E"),
-                    }
-                ) for b in data.get("B", []))
+                balances = data.get("B", [])
+                engine.inventory.update_from_account_position(balances)
+                for b in balances:
+                    db_queue.put_nowait(DbEvent(
+                        type="update_balance",
+                        data={
+                            "bot_run_id": bot_run_id,
+                            "asset": b["a"],
+                            "free": Decimal(b["f"]),
+                            "locked": Decimal(b["l"]),
+                            "source": "user_stream",
+                            "event_time": data.get("E"),
+                        },
+                    ))
 
             elif event_type == "balanceUpdate":
                 asset = data["a"]
@@ -247,6 +250,19 @@ async def command_processor(
         command_queue.task_done()
 
 
+async def run_migrations() -> None:
+    """Alembic migrációk futtatása startup-kor – táblákat ez hozza létre."""
+    from alembic.config import Config as AlembicConfig
+    from alembic import command as alembic_command
+
+    log.info("Adatbázis migrációk futtatása...")
+    alembic_cfg = AlembicConfig("alembic.ini")
+    loop = asyncio.get_event_loop()
+    # Az Alembic sync – executor-ban futtatjuk, hogy ne blokkoljon
+    await loop.run_in_executor(None, lambda: alembic_command.upgrade(alembic_cfg, "head"))
+    log.info("Adatbázis migrációk kész")
+
+
 async def main() -> None:
     # Konfig betöltés
     config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
@@ -255,8 +271,9 @@ async def main() -> None:
     setup_logging(settings.logging.level, settings.logging.json)
     log.info("Kebo Grid Bot indul", config=config_file)
 
-    # DB inicializálás
+    # DB inicializálás + auto migráció
     init_db(settings.database)
+    await run_migrations()
 
     # Queue-k
     ws_send_queue: asyncio.Queue[WsSendCommand] = asyncio.Queue(maxsize=1000)
@@ -276,7 +293,8 @@ async def main() -> None:
             log.ainfo("User stream reconnect – reconciliation szükséges")
         ),
     )
-    engine = GridEngine(settings, ws_api, db_queue, event_queue)
+    market_stream = MarketStream(settings.exchange, settings.bot.symbol)
+    engine = GridEngine(settings, ws_api, db_queue, event_queue, market_stream=market_stream)
     db_writer = DbWriter(db_queue, settings.database.writer_queue_max_size)
     emergency = EmergencyStop(engine, ws_api, db_queue, settings.safety)
     reconciliation = Reconciliation(engine, ws_api, db_queue, settings.safety)
@@ -329,6 +347,7 @@ async def main() -> None:
         tg.create_task(ws_api.writer_loop(), name="ws_writer")
         tg.create_task(ws_api.reader_loop(), name="ws_reader")
         tg.create_task(user_stream.start(), name="user_stream")
+        tg.create_task(market_stream.start(), name="market_stream")  # anchor price-hoz
         tg.create_task(db_writer.run(), name="db_writer")
         tg.create_task(event_dispatcher(event_queue, db_queue, engine), name="event_dispatcher")
         tg.create_task(command_processor(command_queue, engine, emergency), name="cmd_processor")
@@ -337,8 +356,8 @@ async def main() -> None:
         tg.create_task(broadcast_loop(), name="broadcast")
         tg.create_task(uv_server.serve(), name="api_server")
 
-        # Inicializáció (WS csatlakozás után)
-        await asyncio.sleep(2)  # WS kapcsolat felépülésének megvárása
+        # Inicializáció: WS + market stream csatlakozás megvárása, majd engine init
+        await asyncio.sleep(2)
         tg.create_task(engine.initialize(run_id, short_id), name="engine_init")
 
         # Várakozás leállítási jelre
@@ -348,6 +367,7 @@ async def main() -> None:
         # Graceful shutdown
         await ws_api.stop()
         await user_stream.stop()
+        await market_stream.stop()
         await db_writer.stop()
         await reconciliation.stop()
         await watchdog.stop()
