@@ -120,19 +120,29 @@ class GridEngine:
         self.symbol_info = SymbolInfo.from_exchange_info(sym_data)
         log.info("exchangeInfo betöltve", symbol=symbol)
 
-        # exchangeInfo alapján order_quote_value validálás és auto-igazítás
+        # exchangeInfo után order_quote_value számítása (ha nincs explicit megadva)
         min_notional = self.symbol_info.notional.min_notional
         bot_cfg = self.settings.bot
-        if bot_cfg.order_quote_value < min_notional:
-            adjusted = (min_notional * Decimal("1.2")).quantize(Decimal("0.01"))
-            log.warning(
-                "order_quote_value kisebb mint a Binance min_notional – auto-igazítva!",
-                order_quote_value=str(bot_cfg.order_quote_value),
+        available = bot_cfg.total_capital_quote * (1 - bot_cfg.quote_reserve_pct)
+
+        if bot_cfg.order_quote_value is None:
+            # Auto-számítás: tőke / szintek száma, de legalább min_notional × 1.1
+            per_level = (available / bot_cfg.max_grid_levels).quantize(Decimal("0.01"))
+            min_safe = (min_notional * Decimal("1.1")).quantize(Decimal("0.01"))
+            bot_cfg.order_quote_value = max(per_level, min_safe)
+            log.info(
+                "order_quote_value auto-kalkulálva",
+                value=str(bot_cfg.order_quote_value),
+                capital_per_level=str(per_level),
                 min_notional=str(min_notional),
-                adjusted_to=str(adjusted),
-                hint=f"Állítsd be a config-ban: order_quote_value: \"{adjusted}\"",
             )
-            bot_cfg.order_quote_value = adjusted
+        elif bot_cfg.order_quote_value < min_notional:
+            # Explicit megadva, de Binance visszautasítaná – hibával leállunk
+            raise ValueError(
+                f"order_quote_value ({bot_cfg.order_quote_value}) kisebb mint a Binance "
+                f"min_notional ({min_notional}) a {symbol} páron. "
+                f"Állítsd be legalább: order_quote_value: \"{(min_notional * Decimal('1.1')).quantize(Decimal('0.01'))}\""
+            )
 
         # 2. Account + inventory
         account_data = await self.ws_api.get_account()

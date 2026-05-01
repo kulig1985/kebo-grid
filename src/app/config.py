@@ -76,32 +76,28 @@ class BotConfig(BaseModel):
     stop_policy: Literal["cancel_orders_only", "cancel_orders_and_optionally_liquidate_base"] = "cancel_orders_only"
 
     @model_validator(mode="after")
-    def resolve_order_quote_value(self) -> "BotConfig":
+    def validate_order_quote_value(self) -> "BotConfig":
         """
-        Ha order_quote_value nincs megadva: automatikusan kiszámolja.
-        Ha meg van adva: validálja a konzisztenciát.
+        Ha order_quote_value explicit meg van adva: validálja a konzisztenciát.
+        Ha None: a motor számítja ki az exchangeInfo (min_notional) ismeretében.
         """
-        available = self.total_capital_quote * (1 - self.quote_reserve_pct)
-
         if self.order_quote_value is None:
-            # Automatikus számítás: tőke elosztva a szintekre, 2 tizedesre kerekítve
-            self.order_quote_value = (available / self.max_grid_levels).quantize(Decimal("0.01"))
-        else:
-            if self.order_quote_value <= 0:
-                raise ValueError("order_quote_value pozitív kell legyen")
-            if self.order_quote_value > available:
-                raise ValueError(
-                    f"order_quote_value ({self.order_quote_value} USDT) meghaladja az elérhető "
-                    f"tőkét ({available} USDT = {self.total_capital_quote} - {self.quote_reserve_pct*100}% tartalék). "
-                    f"Csökkentsd order_quote_value-t vagy növeld total_capital_quote-t."
-                )
-            max_single = available / 2
-            if self.order_quote_value > max_single:
-                raise ValueError(
-                    f"order_quote_value ({self.order_quote_value} USDT) túl nagy – "
-                    f"legalább 2 grid szinthez elegendő tőke kell. "
-                    f"Maximum: {max_single} USDT."
-                )
+            # Helyes – engine.initialize() fogja beállítani a min_notional figyelembevételével
+            return self
+
+        available = self.total_capital_quote * (1 - self.quote_reserve_pct)
+        if self.order_quote_value <= 0:
+            raise ValueError("order_quote_value pozitív kell legyen")
+        if self.order_quote_value > available:
+            raise ValueError(
+                f"order_quote_value ({self.order_quote_value}) meghaladja az elérhető "
+                f"tőkét ({available} = {self.total_capital_quote} - {self.quote_reserve_pct*100}% tartalék)."
+            )
+        if self.order_quote_value > available / 2:
+            raise ValueError(
+                f"order_quote_value ({self.order_quote_value}) túl nagy – "
+                f"legalább 2 szinthez kell elegendő tőke. Maximum: {available / 2}."
+            )
         return self
 
 
