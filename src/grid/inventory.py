@@ -7,7 +7,7 @@ figyelembe véve a zárolásokat és a tartalékokat.
 from decimal import Decimal
 from typing import Optional
 from app.config import BotConfig
-from app.logging import get_logger
+from app.log_setup import get_logger
 
 log = get_logger(__name__)
 

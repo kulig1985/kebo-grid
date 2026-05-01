@@ -13,7 +13,7 @@ import time
 from typing import Optional
 
 from app.config import SafetyConfig
-from app.logging import get_logger
+from app.log_setup import get_logger
 from exchange.user_stream import UserDataStream
 from exchange.ws_api import BinanceWsApi
 from grid.engine import BotStatus, GridEngine

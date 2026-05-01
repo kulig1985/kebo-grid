@@ -5,7 +5,7 @@ from typing import Optional
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from app.logging import get_logger
+from app.log_setup import get_logger
 
 log = get_logger(__name__)
 

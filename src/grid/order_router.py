@@ -11,7 +11,7 @@ from decimal import Decimal
 from typing import Optional
 
 from app.config import BotConfig
-from app.logging import get_logger
+from app.log_setup import get_logger
 from exchange.ws_api import BinanceWsApi
 from persistence.writer import DbEvent
 

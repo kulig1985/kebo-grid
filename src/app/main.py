@@ -26,7 +26,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from app.config import Settings, load_config
-from app.logging import get_logger, setup_logging
+from app.log_setup import get_logger, setup_logging
 from exchange.market_stream import MarketStream
 from exchange.models import ExecutionReport
 from exchange.user_stream import UserDataStream

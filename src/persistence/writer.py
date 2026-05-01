@@ -3,7 +3,7 @@ import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Optional
-from app.logging import get_logger
+from app.log_setup import get_logger
 from .db import get_session
 from .repositories import (
     BotRunRepo, OrderRepo, FillRepo, ExecutionEventRepo,

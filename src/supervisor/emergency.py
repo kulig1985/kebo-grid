@@ -14,7 +14,7 @@ import asyncio
 from typing import Optional
 
 from app.config import SafetyConfig
-from app.logging import get_logger
+from app.log_setup import get_logger
 from exchange.ws_api import BinanceWsApi
 from grid.engine import BotStatus, GridEngine
 from persistence.writer import DbEvent

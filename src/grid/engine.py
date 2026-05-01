@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Optional
 
 from app.config import Settings
-from app.logging import get_logger
+from app.log_setup import get_logger
 from exchange.market_stream import MarketStream
 from exchange.models import ExecutionReport, SymbolInfo
 from exchange.ws_api import BinanceWsApi

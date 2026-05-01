@@ -17,7 +17,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from app.config import ExchangeConfig
-from app.logging import get_logger
+from app.log_setup import get_logger
 
 log = get_logger(__name__)
 
