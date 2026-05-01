@@ -1,0 +1,45 @@
+x-bot-common: &bot-common
+  build: .
+  restart: unless-stopped
+  env_file: .env
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 15s
+
+services:
+
+  # SOLUSDT bot – API: http://localhost:8081
+  bot-solusdt:
+    <<: *bot-common
+    container_name: kebo-grid-solusdt
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./configs/solusdt.yaml:/app/config.yaml:ro
+
+  # BTCUSDT bot – API: http://localhost:8082
+  # bot-btcusdt:
+  #   <<: *bot-common
+  #   container_name: kebo-grid-btcusdt
+  #   ports:
+  #     - "8082:8080"
+  #   volumes:
+  #     - ./configs/btcusdt.yaml:/app/config.yaml:ro
+
+  # ETHUSDT bot – API: http://localhost:8083
+  # bot-ethusdt:
+  #   <<: *bot-common
+  #   container_name: kebo-grid-ethusdt
+  #   ports:
+  #     - "8083:8080"
+  #   volumes:
+  #     - ./configs/ethusdt.yaml:/app/config.yaml:ro
+
+# MEGJEGYZÉS:
+# - Minden bot saját config YAML-t kap (./configs/<symbol>.yaml)
+# - Az API kulcsok és DB jelszó közös .env fájlból jön
+# - Új pár hozzáadásához: komment eltávolítás + configs/<symbol>.yaml létrehozása
+# - Port: 8081 (SOL), 8082 (BTC), 8083 (ETH), stb.

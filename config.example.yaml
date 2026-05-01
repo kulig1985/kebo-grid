@@ -1,0 +1,66 @@
+exchange:
+  env: testnet  # mainnet | testnet
+  ws_api_url_mainnet: wss://ws-api.binance.com:443/ws-api/v3
+  ws_api_url_testnet: wss://ws-api.testnet.binance.vision/ws-api/v3
+  user_stream_url_mainnet: wss://stream.binance.com:9443/ws
+  user_stream_url_testnet: wss://stream.testnet.binance.vision:9443/ws
+  rest_url_mainnet: https://api.binance.com
+  rest_url_testnet: https://testnet.binance.vision
+  api_key_env: BINANCE_API_KEY
+  secret_key_env: BINANCE_SECRET_KEY
+  recv_window_ms: 5000
+
+bot:
+  symbol: SOLUSDT
+  base_asset: SOL
+  quote_asset: USDT
+  total_capital_quote: "50"
+  order_quote_value: "5"
+  target_net_profit_per_cycle_quote: "0.02"
+  grid_type: geometric         # geometric | arithmetic
+  inventory_mode: prebalanced  # prebalanced | quote_only_bootstrap | use_existing_balances
+  buy_allocation_ratio: "0.5"
+  quote_reserve_pct: "0.02"
+  base_reserve_pct: "0.02"
+  order_type: LIMIT_MAKER      # LIMIT_MAKER | LIMIT
+  time_in_force: GTC
+  max_grid_levels: 20
+  min_grid_step_pct: "0.0025"
+  max_grid_step_pct: "0.05"
+  # buy_side_order_count: 5   # opcionális override
+  # sell_side_order_count: 5  # opcionális override
+
+fees:
+  fee_mode: maker_assumed  # maker_assumed | taker_assumed | custom
+  maker_fee_buy: "0.001"
+  maker_fee_sell: "0.001"
+  taker_fee_buy: "0.001"
+  taker_fee_sell: "0.001"
+
+anchor:
+  source: manual  # manual | best_bid_ask_mid | last_trade
+  manual_price: "80"
+
+safety:
+  external_intervention_policy: pause  # pause | continue_reconcile | emergency_stop
+  max_user_stream_staleness_sec: 10
+  max_trading_ws_staleness_sec: 10
+  cancel_retry_interval_sec: 2
+  cancel_retry_max: 5
+  emergency_stop_on_db_queue_full: true
+  emergency_stop_on_balance_mismatch: true
+  sell_on_emergency_stop: false
+
+database:
+  host: localhost             # Override: DB_HOST env var
+  port: 5432
+  name: kebo_db
+  user: kebo_grid
+  password_env: DATABASE_PASSWORD
+  pool_min_size: 1
+  pool_max_size: 10
+  writer_queue_max_size: 10000
+
+logging:
+  level: INFO
+  json: true

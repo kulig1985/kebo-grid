@@ -1,0 +1,29 @@
+# Szenzitív / lokális konfig – SOHA nem kerül a repo-ba
+.env
+.env.*
+!.env.example
+config.yaml
+configs/*.yaml
+
+# Claude Code belső mappa
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Python
+*.pyc
+__pycache__/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+.eggs/
+
+# OS
+.DS_Store
+Thumbs.db
