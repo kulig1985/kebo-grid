@@ -41,13 +41,14 @@ anchor:
 
 safety:
   external_intervention_policy: pause
-  max_user_stream_staleness_sec: 10
-  max_trading_ws_staleness_sec: 10
+  max_user_stream_staleness_sec: 120
+  max_trading_ws_staleness_sec: 30
   cancel_retry_interval_sec: 2
   cancel_retry_max: 5
   emergency_stop_on_db_queue_full: true
   emergency_stop_on_balance_mismatch: true
   sell_on_emergency_stop: false
+  reconciliation_interval_sec: 60
 
 database:
   # DB kapcsolati adatok az .env fájlból jönnek (DB_HOST, DB_PORT, DB_NAME, DB_USER, DATABASE_PASSWORD)

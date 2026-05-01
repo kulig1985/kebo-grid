@@ -128,10 +128,12 @@ class ExecutionEventRepo:
 
     async def insert_idempotent(self, data: dict) -> None:
         """Idempotens executionReport esemény mentés execution_id alapján."""
-        stmt = insert(ExecutionEvent).values(**data)
-        if data.get("execution_id") is not None:
-            stmt = stmt.on_conflict_do_nothing(index_elements=["execution_id"])
-        await self.session.execute(stmt)
+        from sqlalchemy.exc import IntegrityError
+        try:
+            async with self.session.begin_nested():
+                self.session.add(ExecutionEvent(**data))
+        except IntegrityError:
+            pass
 
 
 class BalanceRepo:

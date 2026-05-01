@@ -123,13 +123,14 @@ safety:
   # continue_reconcile: fut tovább, megpróbál szinkronizálni
   # emergency_stop:     azonnal leáll és mindent töröl
 
-  max_user_stream_staleness_sec: 10   # Ha 10mp-nél régebben nincs esemény → vészleállítás
-  max_trading_ws_staleness_sec: 10
+  max_user_stream_staleness_sec: 120   # Ha ennyi mp-nél régebben nincs esemény → vészleállítás
+  max_trading_ws_staleness_sec: 30
   cancel_retry_interval_sec: 2        # Vészleállítás: cancelAll újrapróbálás (mp)
   cancel_retry_max: 5                 # Maximum újrapróbálkozás
   emergency_stop_on_db_queue_full: true
   emergency_stop_on_balance_mismatch: true
   sell_on_emergency_stop: false       # true: piaci áron eladja a SOL-t leálláskor
+  reconciliation_interval_sec: 60     # állapot egyeztetés gyakorisága (mp)
 
 database:
   # DB kapcsolati adatok (host, port, name, user, password) az .env fájlból jönnek!

@@ -58,13 +58,13 @@ class Watchdog:
         if self.engine.status in (BotStatus.EMERGENCY_STOPPING, BotStatus.EMERGENCY_STOPPED, BotStatus.STOPPED):
             return
 
+        user_stream_age = self.user_stream.last_event_age_sec
+
         # User stream staleness – csak az első valódi esemény UTÁN ellenőriz
-        # (ha a stream él de nincs kereskedés, az nem baj)
         if self.user_stream._first_event_received:
-            age = self.user_stream.last_event_age_sec
-            if age > self.config.max_user_stream_staleness_sec:
+            if user_stream_age > self.config.max_user_stream_staleness_sec:
                 await self.emergency.execute(
-                    f"User stream stale: {age:.1f}s > {self.config.max_user_stream_staleness_sec}s"
+                    f"User stream stale: {user_stream_age:.1f}s > {self.config.max_user_stream_staleness_sec}s"
                 )
                 return
 
@@ -85,7 +85,7 @@ class Watchdog:
         if self.db_writer.is_degraded:
             log.error("DB writer degraded – DB kapcsolat problémás")
 
-        log.debug("Watchdog OK", user_stream_age=f"{age:.1f}s", db_queue=self.db_writer.queue_size)
+        log.debug("Watchdog OK", user_stream_age=f"{user_stream_age:.1f}s", db_queue=self.db_writer.queue_size)
 
     def record_rejection(self) -> None:
         """Order visszautasítás számlálása."""

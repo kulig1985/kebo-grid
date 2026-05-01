@@ -1,67 +1,124 @@
+# ============================================================================
+# Kebo Grid Bot – Konfiguráció
+# ============================================================================
+# Ez a fájl a bot összes beállítását tartalmazza.
+# Másold le "config.yaml"-ként és módosítsd az értékeket.
+#
+# FONTOS: Az adatbázis kapcsolati adatok (host, port, user, jelszó)
+# az .env fájlból jönnek – NEM innen! Lásd: .env.example
+# ============================================================================
+
+# --- Tőzsde kapcsolat ---
 exchange:
-  env: testnet
-  ws_api_url_mainnet: wss://ws-api.binance.com:443/ws-api/v3
-  ws_api_url_testnet: wss://ws-api.testnet.binance.vision/ws-api/v3
-  user_stream_url_mainnet: wss://stream.binance.com:9443/ws
-  user_stream_url_testnet: wss://stream.testnet.binance.vision:9443/ws
-  rest_url_mainnet: https://api.binance.com
-  rest_url_testnet: https://testnet.binance.vision
-  api_key_env: BINANCE_API_KEY
-  secret_key_env: BINANCE_SECRET_KEY
-  recv_window_ms: 5000
+  env: mainnet                # mainnet | testnet
+  # ws_api_url_mainnet: wss://ws-api.binance.com:443/ws-api/v3
+  # ws_api_url_testnet: wss://ws-api.testnet.binance.vision/ws-api/v3
+  # user_stream_url_mainnet: wss://stream.binance.com:9443/ws
+  # user_stream_url_testnet: wss://stream.testnet.binance.vision:9443/ws
+  api_key_env: BINANCE_API_KEY       # az API kulcsot tartalmazó env var neve
+  secret_key_env: BINANCE_SECRET_KEY  # a titkos kulcsot tartalmazó env var neve
+  recv_window_ms: 10000              # szerver idő szinkronizálás miatt 10s
 
+# --- Kereskedési pár és tőke ---
 bot:
-  symbol: SOLUSDT
-  base_asset: SOL
-  quote_asset: USDT
-  total_capital_quote: "50"
-  # order_quote_value: "2.5"   # opcionális – ha nincs megadva: auto = tőke/szintek
+  symbol: SOLUSDC             # kereskedési pár (Binance szimbólum)
+  base_asset: SOL             # alap eszköz
+  quote_asset: USDC           # jegyzett eszköz (a tőkéd ebben van)
+
+  total_capital_quote: "100"  # a bot által kezelt TELJES tőke (USDC-ben)
+  # Ez az egyetlen kötelező tőke-paraméter. A rendszer ebből számít mindent.
+
+  # order_quote_value: "6"    # EGY grid vonal USDC értéke
+  # Ha nem adod meg (ajánlott): a rendszer automatikusan kiszámolja:
+  #   = (total_capital_quote × (1 - quote_reserve_pct)) / max_grid_levels
+  # Mindig legalább min_notional × 1.1 (Binance minimális order méret).
+
   target_net_profit_per_cycle_quote: "0.02"
-  grid_type: geometric
+  # Minimálisan elvárt NETTÓ profit egy buy→sell körön (USDC-ben).
+  # Ebből SZÁMÍTJA a rendszer a szükséges grid lépés %-ot.
+  # Nagyobb érték = ritkább szintek, több profit körvonként
+  # Kisebb érték = sűrűbb grid, több kör, de kevesebb profit
+
+  grid_type: geometric        # geometric | arithmetic
+  # geometric: szintek százalékos távolságra (jobb volatilis piacokon)
+  # arithmetic: szintek fix ár-távolságra
+
   inventory_mode: prebalanced
-  buy_allocation_ratio: "0.5"
-  quote_reserve_pct: "0.02"
-  base_reserve_pct: "0.02"
-  order_type: LIMIT_MAKER
-  time_in_force: GTC
-  max_grid_levels: 20
-  min_grid_step_pct: "0.0025"
-  max_grid_step_pct: "0.05"
+  # prebalanced:              már van base+quote egyenleged, a bot mindkét oldalra tesz
+  # quote_only_bootstrap:     csak quote-od van, a bot először base-t vásárol
+  # use_existing_balances:    meglévő base-t is felhasználja sell-hez
 
+  buy_allocation_ratio: "0.5"  # a tőke hány %-a megy buy oldalra (0.0–1.0)
+  quote_reserve_pct: "0.02"    # quote tartalék % (nem kerül grid-be)
+  base_reserve_pct: "0.02"     # base tartalék %
+  order_type: LIMIT_MAKER      # LIMIT_MAKER | LIMIT
+  # LIMIT_MAKER: post-only (garantált maker díj, olcsóbb)
+  # LIMIT: normál limit order (taker is lehet)
+  time_in_force: GTC           # GTC (Good Til Canceled)
+  max_grid_levels: 20          # maximális grid szintek száma (buy+sell együtt)
+  min_grid_step_pct: "0.0025"  # minimális lépés % (0.25%)
+  max_grid_step_pct: "0.05"    # maximális lépés % (5%)
+  # buy_side_order_count: 10   # opcionális: fix buy szintek száma (felülírja a buy_allocation_ratio-t)
+  # sell_side_order_count: 10  # opcionális: fix sell szintek száma
+
+# --- Bootstrap beállítások (quote_only_bootstrap módhoz) ---
 bootstrap:
-  order_type: MARKET
-  # quote_qty: "25"            # opcionális – auto = total_capital × buy_allocation_ratio
-  limit_price_offset_pct: "0.001"
+  order_type: MARKET           # MARKET | LIMIT | LIMIT_MAKER
+  # MARKET: azonnali végrehajtás piaci áron (taker díj!)
+  # LIMIT: limit áron, offset-tel az anchor alá
+  # LIMIT_MAKER: post-only (lassabb de olcsóbb)
+  # quote_qty: "25"            # opcionális: mennyi USDC-ért vásárol base-t
+  # Ha nincs megadva: total_capital_quote × buy_allocation_ratio
+  limit_price_offset_pct: "0.001"  # LIMIT mód: anchor ár alá ennyivel
 
+# --- Díj beállítások ---
 fees:
-  fee_mode: maker_assumed
-  maker_fee_buy: "0.001"
+  fee_mode: maker_assumed      # maker_assumed | taker_assumed | custom
+  maker_fee_buy: "0.001"      # 0.1% maker díj (Binance alap)
   maker_fee_sell: "0.001"
-  taker_fee_buy: "0.001"
+  taker_fee_buy: "0.001"      # 0.1% taker díj
   taker_fee_sell: "0.001"
 
+# --- Anchor (kiindulási ár) ---
 anchor:
-  source: best_bid_ask_mid
-  # manual_price: "80"         # csak source: manual esetén
+  source: best_bid_ask_mid     # best_bid_ask_mid | last_trade | manual
+  # best_bid_ask_mid: legjobb bid/ask közép (ajánlott – élő piaci ár)
+  # last_trade: utolsó kereskedési ár
+  # manual: kézzel megadott ár (alább)
+  # manual_price: "170"       # csak source: manual esetén
 
+# --- Biztonsági beállítások ---
 safety:
-  external_intervention_policy: pause
-  max_user_stream_staleness_sec: 10
-  max_trading_ws_staleness_sec: 10
-  cancel_retry_interval_sec: 2
-  cancel_retry_max: 5
-  emergency_stop_on_db_queue_full: true
-  emergency_stop_on_balance_mismatch: true
-  sell_on_emergency_stop: false
+  external_intervention_policy: pause   # pause | continue_reconcile | emergency_stop
+  # Mi történjen ha valaki kívülről törli a bot order-ét:
+  # pause: bot megáll, kézi beavatkozás szükséges
+  # continue_reconcile: bot folytatja, újraépíti a grid-et
+  # emergency_stop: azonnali vészleállítás
 
+  max_user_stream_staleness_sec: 120    # user stream timeout (másodperc)
+  # Ha ennyi ideig nincs user stream esemény → vészleállítás.
+  # 120s ajánlott – csendes piacon ritkák az események.
+
+  max_trading_ws_staleness_sec: 30      # trading WS timeout (másodperc)
+  cancel_retry_interval_sec: 2          # cancel retry közötti várakozás
+  cancel_retry_max: 5                   # cancel retry maximum próbálkozás
+  emergency_stop_on_db_queue_full: true  # DB queue telítettségkor vészleállítás
+  emergency_stop_on_balance_mismatch: true  # egyenleg eltéréskor vészleállítás
+  sell_on_emergency_stop: false         # vészleállításkor eladjuk-e a base-t
+  reconciliation_interval_sec: 60       # állapot egyeztetés gyakorisága (másodperc)
+
+# --- Adatbázis (pool beállítások) ---
 database:
-  # DB kapcsolati adatok (host, port, name, user, password) az .env fájlból jönnek!
-  # DB_HOST, DB_PORT, DB_NAME, DB_USER, DATABASE_PASSWORD → .env fájlba
+  # FONTOS: A kapcsolati adatok (host, port, name, user, password)
+  # KIZÁRÓLAG az .env fájlból jönnek (env var-ok):
+  #   DB_HOST, DB_PORT, DB_NAME, DB_USER, DATABASE_PASSWORD
   # Itt CSAK a pool méreteket kell megadni:
   pool_min_size: 1
   pool_max_size: 10
   writer_queue_max_size: 10000
 
+# --- Naplózás ---
 logging:
-  level: INFO
-  json_format: true
+  level: INFO                  # DEBUG | INFO | WARNING | ERROR
+  json_format: true            # true: JSON sorok (Docker/monitoring-hoz)
+                               # false: ember-olvasható szöveges log

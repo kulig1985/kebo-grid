@@ -149,8 +149,8 @@ class AnchorConfig(BaseModel):
 
 class SafetyConfig(BaseModel):
     external_intervention_policy: Literal["pause", "continue_reconcile", "emergency_stop"] = "pause"
-    max_user_stream_staleness_sec: int = 10
-    max_trading_ws_staleness_sec: int = 10
+    max_user_stream_staleness_sec: int = 120
+    max_trading_ws_staleness_sec: int = 30
     cancel_retry_interval_sec: int = 2
     cancel_retry_max: int = 5
     emergency_stop_on_db_queue_full: bool = True

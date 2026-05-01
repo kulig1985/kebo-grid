@@ -70,8 +70,6 @@ async def event_dispatcher(
 
     DB írás SOHA nem itt, csak queue-ba tesz.
     """
-    bot_run_id = engine.bot_run_id or 0
-    # Követjük, hogy melyik order-re volt helyi cancel kérelem
     local_cancels: set[str] = set()
 
     log.info("Event dispatcher elindult")
@@ -83,10 +81,11 @@ async def event_dispatcher(
             continue
 
         event_type = data.get("e")
+        run_id = engine.bot_run_id or 0
 
         try:
             if event_type == "executionReport":
-                await _handle_execution_report(data, db_queue, engine, bot_run_id, local_cancels)
+                await _handle_execution_report(data, db_queue, engine, run_id, local_cancels)
 
             elif event_type == "outboundAccountPosition":
                 balances = data.get("B", [])
@@ -95,7 +94,7 @@ async def event_dispatcher(
                     db_queue.put_nowait(DbEvent(
                         type="update_balance",
                         data={
-                            "bot_run_id": bot_run_id,
+                            "bot_run_id": run_id,
                             "asset": b["a"],
                             "free": Decimal(b["f"]),
                             "locked": Decimal(b["l"]),
@@ -133,11 +132,34 @@ async def _handle_execution_report(
         return
 
     cid = report.client_order_id
+
+    # Nem a bot által küldött order → csak naplózzuk, nem dolgozzuk fel
+    if not cid.startswith("G-"):
+        log.debug("Nem-bot order event kihagyva", cid=cid, status=report.order_status)
+        db_queue.put_nowait(DbEvent(
+            type="insert_execution_event",
+            data={
+                "bot_run_id": bot_run_id,
+                "event_type": "executionReport",
+                "execution_type": report.execution_type,
+                "order_status": report.order_status,
+                "client_order_id": cid,
+                "exchange_order_id": report.order_id,
+                "execution_id": report.execution_id,
+                "trade_id": report.trade_id if report.trade_id >= 0 else None,
+                "event_time": report.event_time,
+                "transaction_time": report.transaction_time,
+                "raw_json": data,
+            },
+        ))
+        return
+
     has_local_cancel = cid in local_cancels
+    # Emergency stop közben minden CANCELED a sajátunk
+    if engine.status in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED") and report.execution_type == "CANCELED":
+        has_local_cancel = True
 
     # Állapotgép átmenet
-    # Az aktuális local állapotot az engine-ből/DB-ből lehetne lekérni,
-    # de a state machine-t úgy implementáltuk, hogy SUBMITTED_UNKNOWN a safe default
     current = LocalOrderState.SUBMITTED_UNKNOWN
     new_state, external = transition_from_execution_report(current, report, has_local_cancel)
 
