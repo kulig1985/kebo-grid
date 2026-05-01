@@ -164,45 +164,49 @@ class SafetyConfig(BaseModel):
 
 
 class DatabaseConfig(BaseModel):
-    host: str = "localhost"     # felülírható: DB_HOST env var
-    port: int = 5432            # felülírható: DB_PORT env var
-    name: str = "kebo_db"      # felülírható: DB_NAME env var
-    user: str = "kebo_grid"    # felülírható: DB_USER env var
-    password_env: str = "DATABASE_PASSWORD"
+    """
+    DB kapcsolati adatok KIZÁRÓLAG az .env fájlból (env var-okból) jönnek:
+      DB_HOST, DB_PORT, DB_NAME, DB_USER, DATABASE_PASSWORD
+
+    YAML-ban csak a pool méreteket kell megadni.
+    """
     pool_min_size: int = 1
     pool_max_size: int = 10
     writer_queue_max_size: int = 10000
 
     @property
-    def resolved_host(self) -> str:
-        """DB_HOST env var felülírja a YAML értéket, ha be van állítva."""
-        return os.environ.get("DB_HOST", self.host)
+    def host(self) -> str:
+        val = os.environ.get("DB_HOST", "")
+        if not val:
+            raise RuntimeError("DB_HOST env var nincs beállítva! Állítsd be az .env fájlban.")
+        return val
 
     @property
-    def resolved_port(self) -> int:
-        """DB_PORT env var felülírja a YAML értéket, ha be van állítva."""
-        val = os.environ.get("DB_PORT")
-        return int(val) if val else self.port
+    def port(self) -> int:
+        return int(os.environ.get("DB_PORT", "5432"))
 
     @property
-    def resolved_name(self) -> str:
-        return os.environ.get("DB_NAME", self.name)
+    def name(self) -> str:
+        return os.environ.get("DB_NAME", "kebo_db")
 
     @property
-    def resolved_user(self) -> str:
-        return os.environ.get("DB_USER", self.user)
+    def user(self) -> str:
+        return os.environ.get("DB_USER", "kebo_grid")
+
+    @property
+    def password(self) -> str:
+        val = os.environ.get("DATABASE_PASSWORD", "")
+        if not val:
+            raise RuntimeError("DATABASE_PASSWORD env var nincs beállítva! Állítsd be az .env fájlban.")
+        return val
 
     @property
     def dsn(self) -> str:
-        password = os.environ.get(self.password_env, "")
-        return (f"postgresql+asyncpg://{self.resolved_user}:{password}"
-                f"@{self.resolved_host}:{self.resolved_port}/{self.resolved_name}")
+        return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
     @property
     def dsn_asyncpg(self) -> str:
-        password = os.environ.get(self.password_env, "")
-        return (f"postgresql://{self.resolved_user}:{password}"
-                f"@{self.resolved_host}:{self.resolved_port}/{self.resolved_name}")
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
 class LoggingConfig(BaseModel):

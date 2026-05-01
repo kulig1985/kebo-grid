@@ -132,14 +132,9 @@ safety:
   sell_on_emergency_stop: false       # true: piaci áron eladja a SOL-t leálláskor
 
 database:
-  # ⚠ Ide a TÉNYLEGES értékeket kell írni, NEM az env var nevét!
-  # Opcionális felülírás: ha DB_HOST / DB_PORT / DB_NAME / DB_USER env var be van állítva,
-  # azok felülírják a YAML értékeket – így elég a .env fájlban megadni őket.
-  host: localhost           # tényleges IP vagy hostname (pl. 95.138.193.102)
-  port: 5432                # tényleges szám – NEM "DB_PORT"!
-  name: kebo_db
-  user: kebo_grid
-  password_env: DATABASE_PASSWORD   # ← egyedül ez egy env var NÉV, a többi tényleges érték
+  # DB kapcsolati adatok (host, port, name, user, password) az .env fájlból jönnek!
+  # DB_HOST, DB_PORT, DB_NAME, DB_USER, DATABASE_PASSWORD → .env fájlba
+  # Itt CSAK a pool méreteket kell megadni:
   pool_min_size: 1
   pool_max_size: 10
   writer_queue_max_size: 10000

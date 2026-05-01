@@ -50,11 +50,7 @@ safety:
   sell_on_emergency_stop: false
 
 database:
-  host: localhost
-  port: 5432
-  name: kebo_db
-  user: kebo_grid
-  password_env: DATABASE_PASSWORD
+  # DB kapcsolati adatok az .env fájlból jönnek (DB_HOST, DB_PORT, DB_NAME, DB_USER, DATABASE_PASSWORD)
   pool_min_size: 1
   pool_max_size: 10
   writer_queue_max_size: 10000
