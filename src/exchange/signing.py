@@ -1,9 +1,24 @@
-"""Binance WebSocket API HMAC-SHA256 aláírás."""
+"""Binance WebSocket API HMAC-SHA256 aláírás + clock drift kezelés."""
 import hashlib
 import hmac
 import time
 import urllib.parse
 from decimal import Decimal
+
+# Globális időeltérés Binance szerverhez képest (milliszekundumban).
+# Pozitív = a mi óránk siet, negatív = késik.
+_time_offset_ms: int = 0
+
+
+def set_time_offset(offset_ms: int) -> None:
+    """Beállítja a clock drift korrekciót Binance server time alapján."""
+    global _time_offset_ms
+    _time_offset_ms = offset_ms
+
+
+def make_timestamp() -> int:
+    """Aktuális időbélyeg milliszekundumban, clock drift korrekcióval."""
+    return int(time.time() * 1000) + _time_offset_ms
 
 
 def sign_params(params: dict, secret_key: str) -> dict:
@@ -16,7 +31,6 @@ def sign_params(params: dict, secret_key: str) -> dict:
     filtered = {k: v for k, v in params.items() if k not in ("signature",)}
     sorted_params = dict(sorted(filtered.items()))
 
-    # Decimal-okat stringgé alakítjuk (trailing zeros nélkül)
     str_params = {}
     for k, v in sorted_params.items():
         if isinstance(v, Decimal):
@@ -32,8 +46,3 @@ def sign_params(params: dict, secret_key: str) -> dict:
     ).hexdigest()
 
     return {**sorted_params, "signature": signature}
-
-
-def make_timestamp() -> int:
-    """Aktuális időbélyeg milliszekundumban."""
-    return int(time.time() * 1000)

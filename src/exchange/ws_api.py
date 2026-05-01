@@ -22,7 +22,7 @@ from websockets.exceptions import ConnectionClosed
 
 from app.config import ExchangeConfig
 from app.log_setup import get_logger
-from .signing import sign_params, make_timestamp
+from .signing import sign_params, make_timestamp, set_time_offset
 
 log = get_logger(__name__)
 
@@ -131,6 +131,8 @@ class BinanceWsApi:
         self._connect_time = time.monotonic()
         self._connected.set()
         log.info("WS API csatlakozva")
+        # Csatlakozás után szinkronizáljuk az időt a Binance szerverrel
+        await self._sync_server_time()
 
     async def _write_loop(self) -> None:
         while self._running and self._ws is not None:
@@ -278,6 +280,22 @@ class BinanceWsApi:
         )
         self.send_queue.put_nowait(cmd)
         return request_id
+
+    async def _sync_server_time(self) -> None:
+        """Binance server time lekérése és clock drift korrekció beállítása."""
+        try:
+            result = await self._query("time", {}, authenticated=False)
+            server_time_ms = result["serverTime"]
+            local_time_ms = int(time.time() * 1000)
+            offset = server_time_ms - local_time_ms
+            set_time_offset(offset)
+            if abs(offset) > 1000:
+                log.warning("Rendszeróra eltérés detektálva", offset_ms=offset,
+                            hint="Futtasd: sudo timedatectl set-ntp true")
+            else:
+                log.info("Szerver idő szinkronizálva", offset_ms=offset)
+        except Exception as e:
+            log.warning("Szerver idő szinkron sikertelen, alapértelmezett offset használata", error=str(e))
 
     # --- Query metódusok (várakozással) ---
 

@@ -16,7 +16,7 @@ class ExchangeConfig(BaseModel):
     rest_url_testnet: str = "https://testnet.binance.vision"
     api_key_env: str = "BINANCE_API_KEY"
     secret_key_env: str = "BINANCE_SECRET_KEY"
-    recv_window_ms: int = 5000
+    recv_window_ms: int = 10000  # 10s – a szerver idő szinkronizálás miatt növelve
 
     @property
     def ws_api_url(self) -> str:
