@@ -29,7 +29,7 @@ class BotRun(Base):
     grid_step_pct: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 8))
     grid_step_abs: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))
     total_capital_quote: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
-    order_quote_value: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
+    order_quote_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))  # exchangeInfo után kerül beállításra
     target_net_profit_quote: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 8))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

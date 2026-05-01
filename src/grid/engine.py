@@ -215,9 +215,16 @@ class GridEngine:
             type=bot.grid_type,
             k_buy=self.grid_plan.k_buy,
             k_sell=self.grid_plan.k_sell,
+            order_quote_value=str(bot.order_quote_value),
             quote_needed=str(self.grid_plan.total_quote_required),
             base_needed=str(self.grid_plan.total_base_required),
         )
+
+        # order_quote_value végleges értékének mentése DB-be (most már ismert)
+        self.db_queue.put_nowait(DbEvent(
+            type="update_bot_run_order_quote_value",
+            data={"run_id": bot_run_id, "order_quote_value": bot.order_quote_value},
+        ))
 
         # 5. Kezdeti order-ek elküldése (non-blocking)
         self.status = BotStatus.RUNNING

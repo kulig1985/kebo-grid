@@ -95,6 +95,15 @@ class DbWriter:
                         repo = BotRunRepo(session)
                         await repo.update_status(event.data["run_id"], event.data["status"])
 
+                    case "update_bot_run_order_quote_value":
+                        from sqlalchemy import update as sa_update
+                        from .models import BotRun
+                        await session.execute(
+                            sa_update(BotRun)
+                            .where(BotRun.id == event.data["run_id"])
+                            .values(order_quote_value=event.data["order_quote_value"])
+                        )
+
                     case "log_system_event":
                         repo = SystemEventRepo(session)
                         await repo.log(**event.data)
