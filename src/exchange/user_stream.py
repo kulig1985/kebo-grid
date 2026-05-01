@@ -50,6 +50,7 @@ class UserDataStream:
         self._reconnect_count = 0
         self._last_event_time = 0.0
         self._connected_once = False
+        self._first_event_received = False  # valódi executionReport/balance után True
 
     async def start(self) -> None:
         """Fő reader loop elindítása."""
@@ -111,14 +112,14 @@ class UserDataStream:
         ) as ws:
             log.info("User stream csatlakozva")
             self._connected_once = True
-            self._last_event_time = time.monotonic()  # grace period: 10s az első eseményig
             async for message in ws:
-                self._last_event_time = time.monotonic()
                 try:
                     data = json.loads(message)
                     event_type = data.get("e")
 
                     if event_type in ("executionReport", "outboundAccountPosition", "balanceUpdate"):
+                        self._last_event_time = time.monotonic()
+                        self._first_event_received = True
                         self.event_queue.put_nowait(data)
                     elif event_type == "listenKeyExpired":
                         log.warning("listenKey lejárt, újracsatlakozás szükséges")

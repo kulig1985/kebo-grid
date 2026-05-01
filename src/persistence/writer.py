@@ -63,14 +63,12 @@ class DbWriter:
             async with get_session() as session:
                 match event.type:
                     case "upsert_order_from_intent":
-                        from .models import OrderIntent
-                        repo = OrderRepo(session)
-                        # Az intent már mentve volt, csak az ordert hozzuk létre
-                        intent_data = event.data
-                        # Közvetlenül az Order táblába írunk
                         from sqlalchemy.dialects.postgresql import insert
                         from .models import Order
-                        stmt = insert(Order).values(**intent_data).on_conflict_do_nothing(
+                        # Csak az orders táblában lévő oszlopokkal
+                        order_cols = {c.name for c in Order.__table__.columns}
+                        filtered = {k: v for k, v in event.data.items() if k in order_cols}
+                        stmt = insert(Order).values(**filtered).on_conflict_do_nothing(
                             index_elements=["client_order_id"]
                         )
                         await session.execute(stmt)

@@ -58,8 +58,9 @@ class Watchdog:
         if self.engine.status in (BotStatus.EMERGENCY_STOPPING, BotStatus.EMERGENCY_STOPPED, BotStatus.STOPPED):
             return
 
-        # User stream staleness – csak az első sikeres kapcsolat UTÁN ellenőriz
-        if self.user_stream._connected_once:
+        # User stream staleness – csak az első valódi esemény UTÁN ellenőriz
+        # (ha a stream él de nincs kereskedés, az nem baj)
+        if self.user_stream._first_event_received:
             age = self.user_stream.last_event_age_sec
             if age > self.config.max_user_stream_staleness_sec:
                 await self.emergency.execute(

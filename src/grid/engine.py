@@ -147,7 +147,10 @@ class GridEngine:
         # 2. Account + inventory
         account_data = await self.ws_api.get_account()
         self.inventory.update_from_account(account_data.get("balances", []))
-        log.info("Account betöltve", balances=self.inventory.snapshot())
+        # Csak a bot által kezelt asseteket logoljuk (nem az összes 600+ assetot)
+        bot_assets = {self.settings.bot.base_asset, self.settings.bot.quote_asset}
+        relevant = {a: v for a, v in self.inventory.snapshot().items() if a in bot_assets}
+        log.info("Account betöltve", balances=relevant)
 
         # 3. Anchor price
         anchor_price = await self._determine_anchor_price()

@@ -246,7 +246,8 @@ class BinanceWsApi:
             "newClientOrderId": client_order_id,
             "newOrderRespType": "ACK",
         }
-        if order_type != "MARKET":
+        # LIMIT_MAKER nem fogad timeInForce-t (mindig GTC); csak LIMIT-nél kell
+        if order_type == "LIMIT":
             params["timeInForce"] = time_in_force
 
         cmd = WsSendCommand(

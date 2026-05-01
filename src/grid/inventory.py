@@ -31,7 +31,10 @@ class InventoryManager:
             asset = b["asset"]
             self._free[asset] = Decimal(str(b.get("free", "0")))
             self._locked[asset] = Decimal(str(b.get("locked", "0")))
-        log.debug("Egyenleg frissítve (account)", assets=list(self._free.keys()))
+        # Csak a nem-nulla egyenlegeket logoljuk
+        nonzero = {a: {"free": str(f), "locked": str(self._locked.get(a, Decimal("0")))}
+                   for a, f in self._free.items() if f > 0}
+        log.debug("Egyenleg frissítve (account)", nonzero_assets=nonzero)
 
     def update_from_account_position(self, balances: list[dict]) -> None:
         """outboundAccountPosition eseményből frissítés."""
