@@ -28,15 +28,26 @@ bot:
 
   target_net_profit_per_cycle_quote: "0.02"
   # ▶ Minimálisan elvárt NETTÓ profit egy buy-sell körön (USDT).
-  # A rendszer EBBŐL SZÁMOLJA a szükséges grid lépés %-ot!
-  #   képlet: r = (1 + fee_buy + profit/order_value) / (1 - fee_sell)
-  # Példa: 5 USDT/order, 0.1% díj, 0.02 USDT profit cél → r ≈ 1.006 (0.6% lépés)
+  # Ebből számolja a rendszer a szükséges lépésközt – de ELTÉRŐEN a két grid típusnál:
+  #
+  # GEOMETRIC grid_type esetén:
+  #   Képlet: r = (1 + fee_buy + profit/order_value) / (1 - fee_sell)
+  #   A lépés %-os → minden szinten AZONOS a profit (mindig pontosan ≥ 0.02 USDT)
+  #   Példa: 2.45 USDT/order, 0.1% díj → r ≈ 1.009 (0.9% lépés)
+  #
+  # ARITHMETIC grid_type esetén:
+  #   Képlet: d = anchor_price × (r - 1), ahol r ugyanaz a képletből
+  #   A lépés fix USDT összeg → a % szintenként VÁLTOZIK (mélyebb szinten nagyobb %)
+  #   Garantált minimum: a legmagasabb buy szintnél (anchor közelében) is ≥ 0.02 USDT
+  #   Mélyebb szinteken a profit magasabb, mert ugyanaz a d-USDT kisebb árnál nagyobb %
+  #   Tehát: 0.02 USDT MINIMUM, alacsonyabb áron több profit/ciklus
+  #
   # Ha növeled: ritkább szintek, nagyobb profit körvonként, kevesebb kötés
   # Ha csökkented: sűrűbb szintek, kisebb profit körvonként, több kötés
 
   grid_type: geometric
-  # geometric: szintek közötti távolság %-os (természetes volatilitáshoz jobb)
-  # arithmetic: szintek közötti távolság fix USDT összeg
+  # geometric:   lépés %-os → minden szinten azonos profit/ciklus (ajánlott)
+  # arithmetic:  lépés fix USDT → profit szintenként változik (mélyebben több)
 
   inventory_mode: prebalanced
   # prebalanced:          van meglévő SOL-od, azt használja sell order-ekhez
