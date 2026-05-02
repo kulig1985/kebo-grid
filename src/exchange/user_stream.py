@@ -50,7 +50,8 @@ class UserDataStream:
         self._reconnect_count = 0
         self._last_event_time = 0.0
         self._connected_once = False
-        self._first_event_received = False  # valódi executionReport/balance után True
+        self._first_event_received = False
+        self.connected = asyncio.Event()
 
     async def start(self) -> None:
         """Fő reader loop elindítása."""
@@ -71,6 +72,7 @@ class UserDataStream:
             if not self._running:
                 break
 
+            self.connected.clear()
             jitter = random.uniform(0, delay * 0.3)
             await asyncio.sleep(delay + jitter)
             delay = min(delay * 2, RECONNECT_MAX_DELAY)
@@ -112,6 +114,7 @@ class UserDataStream:
         ) as ws:
             log.info("User stream csatlakozva")
             self._connected_once = True
+            self.connected.set()
             async for message in ws:
                 try:
                     data = json.loads(message)

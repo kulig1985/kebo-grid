@@ -16,6 +16,7 @@ from app.config import Settings
 from app.log_setup import get_logger
 from exchange.market_stream import MarketStream
 from exchange.models import ExecutionReport, SymbolInfo
+from exchange.precision import round_down_to_step, round_price_to_tick
 from exchange.ws_api import BinanceWsApi
 from grid.calculator import GridCalculator, GridLevel, GridPlan
 from grid.inventory import InventoryManager
@@ -70,11 +71,13 @@ class GridEngine:
         self.router: Optional[OrderRouter] = None
         self.calculator = GridCalculator()
 
+        # Grid map: level_index → GridLevel – O(1) counter order lookup
+        self.grid_map: dict[int, GridLevel] = {}
+
         # Szint -> aktív order ID tracking
         self._level_orders: dict[int, str] = {}  # level_index -> client_order_id
         self._order_levels: dict[str, int] = {}  # client_order_id -> level_index
         self._order_sides: dict[str, str] = {}   # client_order_id -> BUY|SELL
-        self._filled_buys: dict[str, ExecutionReport] = {}  # cid -> report
 
         self._cycle_seq = 0
         self._order_seq = 0
@@ -225,10 +228,38 @@ class GridEngine:
             base_needed=str(self.grid_plan.total_base_required),
         )
 
-        # order_quote_value végleges értékének mentése DB-be (most már ismert)
+        # Grid map építés – O(1) counter order lookup
+        self.grid_map = {}
+        for level in self.grid_plan.buy_levels:
+            self.grid_map[level.index] = level
+        for level in self.grid_plan.sell_levels:
+            self.grid_map[level.index] = level
+        self.grid_map[0] = GridLevel(
+            index=0, price=anchor_price, side="ANCHOR",
+            quantity=Decimal("0"), notional=Decimal("0"), zone="ANCHOR",
+        )
+
+        # Grid paraméterek + szintek mentése DB-be (recovery-hez)
         self.db_queue.put_nowait(DbEvent(
-            type="update_bot_run_order_quote_value",
-            data={"run_id": bot_run_id, "order_quote_value": bot.order_quote_value},
+            type="update_bot_run_grid_params",
+            data={
+                "run_id": bot_run_id,
+                "anchor_price": self.grid_plan.anchor_price,
+                "grid_step_pct": self.grid_plan.grid_step_pct,
+                "grid_step_abs": self.grid_plan.grid_step_abs,
+                "order_quote_value": bot.order_quote_value,
+            },
+        ))
+        levels_to_save = []
+        for level in self.grid_map.values():
+            levels_to_save.append({
+                "level_index": level.index,
+                "price": level.price,
+                "side_zone": level.zone,
+            })
+        self.db_queue.put_nowait(DbEvent(
+            type="save_grid_levels",
+            data={"bot_run_id": bot_run_id, "levels": levels_to_save},
         ))
 
         # 5. Kezdeti order-ek elküldése (non-blocking)
@@ -344,13 +375,16 @@ class GridEngine:
             await self._on_order_filled(report)
 
     async def _on_order_filled(self, report: ExecutionReport) -> None:
-        """Fill esemény: counter order küldése."""
+        """
+        Fill esemény: counter order küldése fix grid vonalakról.
+
+        O(1) grid_map lookup – nincs újraszámolás, nincs DB olvasás.
+        """
         if self.status != BotStatus.RUNNING:
             log.info("Bot nem fut, counter order kihagyva", status=self.status)
             return
 
-        assert self.grid_plan is not None
-        assert self.router is not None
+        assert self.symbol_info is not None
 
         cid = report.client_order_id
         level_index = self._order_levels.get(cid)
@@ -363,53 +397,41 @@ class GridEngine:
         self._cycle_seq += 1
 
         if side == "BUY":
-            # Buy filled → sell counter order a következő szinten
-            next_index = level_index + 1
-            sell_level = self._find_sell_level(next_index)
-            if sell_level is None:
-                log.warning("Nincs sell szint a buy fill-hez", level_index=level_index)
-                return
-
-            # Tényleges töltött mennyiség (base commission levonva ha base-ben fizettük)
+            counter_index = level_index + 1
+            counter_side = "SELL"
             qty = report.cumulative_filled_qty
             if report.commission_asset == self.settings.bot.base_asset:
                 qty -= report.commission_amount
+            qty = round_down_to_step(qty, self.symbol_info.lot_size.step_size)
+        else:
+            counter_index = level_index - 1
+            counter_side = "BUY"
+            qty = Decimal("0")  # lentebb számítjuk
 
-            sell_level_copy = GridLevel(
-                index=sell_level.index,
-                price=sell_level.price,
-                side="SELL",
-                quantity=qty,
-                notional=qty * sell_level.price,
-                zone=sell_level.zone,
+        grid_line = self.grid_map.get(counter_index)
+        if grid_line is None:
+            log.error("Nincs grid vonal a counter indexhez", counter_index=counter_index, filled_cid=cid)
+            return
+        counter_price = grid_line.price
+
+        if side == "SELL":
+            qty = round_down_to_step(
+                self.settings.bot.order_quote_value / counter_price,
+                self.symbol_info.lot_size.step_size,
             )
-            self._submit_level_order(sell_level_copy, cycle_id=self._cycle_seq)
-            log.info("Counter sell order beküldve", level=next_index, qty=str(qty))
 
-        elif side == "SELL":
-            # Sell filled → buy counter order az előző szinten
-            next_index = level_index - 1
-            buy_level = self._find_buy_level(next_index)
-            if buy_level is None:
-                log.warning("Nincs buy szint a sell fill-hez", level_index=level_index)
-                return
-
-            self._submit_level_order(buy_level, cycle_id=self._cycle_seq)
-            log.info("Counter buy order beküldve", level=next_index)
-
-    def _find_sell_level(self, index: int) -> Optional[GridLevel]:
-        assert self.grid_plan is not None
-        for lv in self.grid_plan.sell_levels:
-            if lv.index == index:
-                return lv
-        return None
-
-    def _find_buy_level(self, index: int) -> Optional[GridLevel]:
-        assert self.grid_plan is not None
-        for lv in self.grid_plan.buy_levels:
-            if lv.index == index:
-                return lv
-        return None
+        counter_level = GridLevel(
+            index=counter_index,
+            price=counter_price,
+            side=counter_side,
+            quantity=qty,
+            notional=qty * counter_price,
+            zone="ABOVE_ANCHOR" if counter_price > self.grid_map.get(0, grid_line).price else "BELOW_ANCHOR",
+        )
+        self._submit_level_order(counter_level, cycle_id=self._cycle_seq)
+        log.info("Counter order beküldve",
+                 filled_side=side, filled_level=level_index,
+                 counter_side=counter_side, counter_price=str(counter_price), qty=str(qty))
 
     async def _execute_bootstrap(self) -> None:
         """Bootstrap: MARKET buy küldése a sell grid orderekhez szükséges base megszerzéséhez."""
@@ -522,6 +544,128 @@ class GridEngine:
             placed += 1
 
         log.info("Bootstrap sell orderek beküldve", count=placed, remaining_base=str(remaining))
+
+    async def recover(
+        self,
+        bot_run_id: int,
+        bot_run_short_id: str,
+        bot_run_record,
+        grid_levels_db: list,
+        open_orders: list[dict],
+        symbol_info: SymbolInfo,
+    ) -> None:
+        """
+        Recovery: bent ragadt orderekből újraépíti a grid állapotot.
+
+        1. grid_map újraépítés DB-ből
+        2. In-memory tracking újraépítés open orderekből
+        3. Sequence counters visszaállítás
+        4. Account frissítés
+        """
+        self.bot_run_id = bot_run_id
+        self._bot_run_short_id = bot_run_short_id
+        self.symbol_info = symbol_info
+        self.router = OrderRouter(self.ws_api, self.db_queue, bot_run_id, self.settings.bot)
+
+        log.info("Recovery indítás", bot_run_id=bot_run_id)
+
+        # Szerver idő szinkronizálás
+        try:
+            result = await self.ws_api._query("time", {}, authenticated=False)
+            server_ms = result["serverTime"]
+            local_ms = int(time.time() * 1000)
+            offset = server_ms - local_ms
+            from exchange.signing import set_time_offset
+            set_time_offset(offset)
+            log.info("Szerver idő szinkronizálva (recovery)", offset_ms=offset)
+        except Exception as e:
+            log.warning("Szerver idő szinkron sikertelen", error=str(e))
+
+        # Grid map újraépítés DB-ből
+        self.grid_map = {}
+        buy_levels: list[GridLevel] = []
+        sell_levels: list[GridLevel] = []
+        for gl in grid_levels_db:
+            if gl.level_index < 0:
+                side = "BUY"
+            elif gl.level_index > 0:
+                side = "SELL"
+            else:
+                side = "ANCHOR"
+            level = GridLevel(
+                index=gl.level_index, price=gl.price, side=side,
+                quantity=Decimal("0"), notional=Decimal("0"), zone=gl.side_zone,
+            )
+            self.grid_map[gl.level_index] = level
+            if gl.level_index < 0:
+                buy_levels.append(level)
+            elif gl.level_index > 0:
+                sell_levels.append(level)
+
+        self.grid_plan = GridPlan(
+            grid_type=bot_run_record.grid_type,
+            anchor_price=bot_run_record.anchor_price,
+            grid_step_pct=bot_run_record.grid_step_pct,
+            grid_step_abs=bot_run_record.grid_step_abs,
+            buy_levels=buy_levels,
+            sell_levels=sell_levels,
+            k_buy=len(buy_levels),
+            k_sell=len(sell_levels),
+            total_quote_required=Decimal("0"),
+            total_base_required=Decimal("0"),
+        )
+
+        # order_quote_value visszaállítás
+        if bot_run_record.order_quote_value:
+            self.settings.bot.order_quote_value = bot_run_record.order_quote_value
+
+        # In-memory tracking újraépítés az exchange open orderekből
+        for order in open_orders:
+            cid = order.get("clientOrderId", "")
+            if not cid.startswith("G-"):
+                continue
+            parts = cid.split("-")
+            if len(parts) < 6:
+                continue
+            side_char = parts[2]
+            if side_char == "BOOT":
+                self._bootstrap_cid = cid
+                self._bootstrap_pending = True
+                log.info("Bootstrap order recovery", cid=cid)
+                continue
+            level_abs = int(parts[3])
+            side = "BUY" if side_char == "B" else "SELL"
+            level_index = -level_abs if side == "BUY" else level_abs
+
+            self._level_orders[level_index] = cid
+            self._order_levels[cid] = level_index
+            self._order_sides[cid] = side
+            self.router._submitted.add(cid)
+
+        # Sequence counters: legmagasabb cycle és seq megkeresése
+        max_cycle = 0
+        max_seq = 0
+        for cid in self._order_levels:
+            parts = cid.split("-")
+            if len(parts) >= 6:
+                max_cycle = max(max_cycle, int(parts[4]))
+                max_seq = max(max_seq, int(parts[5]))
+        self._cycle_seq = max_cycle + 1
+        self._order_seq = max_seq + 1
+
+        # Account frissítés
+        account_data = await self.ws_api.get_account()
+        self.inventory.update_from_account(account_data.get("balances", []))
+        bot_assets = {self.settings.bot.base_asset, self.settings.bot.quote_asset}
+        relevant = {a: v for a, v in self.inventory.snapshot().items() if a in bot_assets}
+
+        self.status = BotStatus.RUNNING
+        log.info("Recovery kész",
+                 bot_run_id=bot_run_id,
+                 open_orders=len(self._level_orders),
+                 grid_levels=len(self.grid_map),
+                 balances=relevant,
+                 bootstrap_pending=self._bootstrap_pending)
 
     async def on_external_cancel(self, report: ExecutionReport) -> None:
         """Külső beavatkozás: order törlése nem a bot által."""

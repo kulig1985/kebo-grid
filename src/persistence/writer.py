@@ -7,7 +7,7 @@ from app.log_setup import get_logger
 from .db import get_session
 from .repositories import (
     BotRunRepo, OrderRepo, FillRepo, ExecutionEventRepo,
-    BalanceRepo, SystemEventRepo, ExternalEventRepo,
+    BalanceRepo, SystemEventRepo, ExternalEventRepo, GridLevelRepo,
 )
 
 log = get_logger(__name__)
@@ -100,6 +100,27 @@ class DbWriter:
                             sa_update(BotRun)
                             .where(BotRun.id == event.data["run_id"])
                             .values(order_quote_value=event.data["order_quote_value"])
+                        )
+
+                    case "update_bot_run_grid_params":
+                        from sqlalchemy import update as sa_update
+                        from .models import BotRun
+                        await session.execute(
+                            sa_update(BotRun)
+                            .where(BotRun.id == event.data["run_id"])
+                            .values(
+                                anchor_price=event.data["anchor_price"],
+                                grid_step_pct=event.data.get("grid_step_pct"),
+                                grid_step_abs=event.data.get("grid_step_abs"),
+                                order_quote_value=event.data["order_quote_value"],
+                            )
+                        )
+
+                    case "save_grid_levels":
+                        repo = GridLevelRepo(session)
+                        await repo.bulk_upsert(
+                            event.data["bot_run_id"],
+                            event.data["levels"],
                         )
 
                     case "log_system_event":

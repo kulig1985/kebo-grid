@@ -28,14 +28,14 @@ from fastapi import FastAPI
 from app.config import Settings, load_config
 from app.log_setup import get_logger, setup_logging
 from exchange.market_stream import MarketStream
-from exchange.models import ExecutionReport
+from exchange.models import ExecutionReport, SymbolInfo
 from exchange.user_stream import UserDataStream
 from exchange.ws_api import BinanceWsApi, WsSendCommand
 from grid.engine import GridEngine
 from grid.state_machine import LocalOrderState, transition_from_execution_report
 from persistence.db import close_db, init_db
 from persistence.models import BotRun
-from persistence.repositories import BotRunRepo
+from persistence.repositories import BotRunRepo, GridLevelRepo
 from persistence.writer import DbEvent, DbWriter
 from supervisor.emergency import EmergencyStop
 from supervisor.reconciliation import Reconciliation
@@ -58,6 +58,15 @@ def make_run_short_id(run_id: int) -> str:
         result.append(chars[n % 36])
         n //= 36
     return "".join(reversed(result))
+
+
+def parse_run_short_id(short: str) -> int:
+    """short_id-ból visszaállítja a bot_run.id-t (make_run_short_id inverze)."""
+    chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+    n = 0
+    for c in short:
+        n = n * 36 + chars.index(c)
+    return n
 
 
 async def event_dispatcher(
@@ -294,6 +303,78 @@ async def run_migrations() -> None:
     log.info("Adatbázis migrációk kész")
 
 
+async def _try_recovery(
+    engine: GridEngine,
+    ws_api: BinanceWsApi,
+    settings,
+    bot_orders: list[dict],
+    db_queue: asyncio.Queue,
+) -> None:
+    """Megpróbálja a korábbi run-t folytatni a bent ragadt orderekből."""
+    from persistence.db import get_session
+
+    first_cid = bot_orders[0]["clientOrderId"]
+    parts = first_cid.split("-")
+    if len(parts) < 2:
+        log.warning("Érvénytelen bot order CID, recovery kihagyva", cid=first_cid)
+        return
+
+    run6 = parts[1]
+    run_id = parse_run_short_id(run6)
+    symbol = settings.bot.symbol
+    log.info("Recovery jelölt", run_id=run_id, short_id=run6, open_bot_orders=len(bot_orders))
+
+    async with get_session() as session:
+        repo = BotRunRepo(session)
+        bot_run = await repo.get(run_id)
+
+        if bot_run is None:
+            log.warning("Bot run nem található DB-ben, korábbi orderek törlése", run_id=run_id)
+            ws_api.enqueue_cancel_all(symbol)
+            return
+
+        if bot_run.symbol != symbol:
+            log.warning("Symbol mismatch, korábbi orderek törlése",
+                        db_symbol=bot_run.symbol, config_symbol=symbol)
+            ws_api.enqueue_cancel_all(symbol)
+            return
+
+        grid_level_repo = GridLevelRepo(session)
+        grid_levels = await grid_level_repo.load_by_run(run_id)
+
+        if not grid_levels:
+            log.warning("Nincsenek grid szintek DB-ben, recovery nem lehetséges, orderek törlése")
+            ws_api.enqueue_cancel_all(symbol)
+            return
+
+    # exchangeInfo lekérés (precision filterek kellenek)
+    info_data = await ws_api.get_exchange_info(symbol)
+    symbols = info_data.get("symbols", [])
+    sym_data = next((s for s in symbols if s["symbol"] == symbol), None)
+    if sym_data is None:
+        log.error("Symbol nem található az exchangeInfo-ban", symbol=symbol)
+        ws_api.enqueue_cancel_all(symbol)
+        return
+    symbol_info = SymbolInfo.from_exchange_info(sym_data)
+
+    # Recovery végrehajtás
+    await engine.recover(
+        bot_run_id=run_id,
+        bot_run_short_id=run6,
+        bot_run_record=bot_run,
+        grid_levels_db=grid_levels,
+        open_orders=bot_orders,
+        symbol_info=symbol_info,
+    )
+
+    # Bot run status frissítés DB-ben
+    db_queue.put_nowait(DbEvent(
+        type="update_bot_status",
+        data={"run_id": run_id, "status": "RUNNING"},
+    ))
+    log.info("Recovery sikeres, bot fut", run_id=run_id)
+
+
 async def main() -> None:
     # Konfig betöltés
     config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
@@ -333,25 +414,6 @@ async def main() -> None:
     reconciliation = Reconciliation(engine, ws_api, db_queue, settings.safety)
     watchdog = Watchdog(engine, ws_api, user_stream, db_writer, emergency, settings.safety)
 
-    # Bot run rekord létrehozása DB-ben
-    async with __import__("persistence.db", fromlist=["get_session"]).get_session() as session:
-        repo = BotRunRepo(session)
-        run = await repo.create({
-            "symbol": settings.bot.symbol,
-            "base_asset": settings.bot.base_asset,
-            "quote_asset": settings.bot.quote_asset,
-            "status": "INITIALIZING",
-            "config_json": settings.bot.model_dump(mode="json"),
-            "grid_type": settings.bot.grid_type,
-            "total_capital_quote": settings.bot.total_capital_quote,
-            "order_quote_value": settings.bot.order_quote_value,
-            "target_net_profit_quote": settings.bot.target_net_profit_per_cycle_quote,
-        })
-        run_id = run.id
-
-    short_id = make_run_short_id(run_id)
-    log.info("Bot run létrehozva", run_id=run_id, short_id=short_id)
-
     # FastAPI app
     app = FastAPI(title="Kebo Grid Bot API")
     app.include_router(api_router)
@@ -389,9 +451,45 @@ async def main() -> None:
         tg.create_task(broadcast_loop(), name="broadcast")
         tg.create_task(uv_server.serve(), name="api_server")
 
-        # Inicializáció: WS + market stream csatlakozás megvárása, majd engine init
-        await asyncio.sleep(2)
-        tg.create_task(engine.initialize(run_id, short_id), name="engine_init")
+        # Inicializáció: ELŐBB connection, AZTÁN recovery check, AZTÁN döntés
+        log.info("Várakozás WS API és user stream csatlakozásra...")
+        try:
+            await asyncio.wait_for(ws_api._connected.wait(), timeout=30.0)
+            log.info("WS API csatlakozva, várakozás user stream-re...")
+            await asyncio.wait_for(user_stream.connected.wait(), timeout=30.0)
+            log.info("User stream csatlakozva")
+        except asyncio.TimeoutError:
+            raise RuntimeError("WS API vagy user stream nem csatlakozott 30s alatt!")
+
+        # Recovery check: van-e bent ragadt order az exchange-en?
+        symbol = settings.bot.symbol
+        log.info("Open orders lekérdezés...", symbol=symbol)
+        existing_orders = await ws_api.get_open_orders(symbol)
+        bot_orders = [o for o in existing_orders if o.get("clientOrderId", "").startswith("G-")]
+
+        if bot_orders:
+            await _try_recovery(engine, ws_api, settings, bot_orders, db_queue)
+
+        if engine.status == "INITIALIZING":
+            # Friss indítás: bot_run létrehozás + engine.initialize()
+            from persistence.db import get_session
+            async with get_session() as session:
+                repo = BotRunRepo(session)
+                run = await repo.create({
+                    "symbol": settings.bot.symbol,
+                    "base_asset": settings.bot.base_asset,
+                    "quote_asset": settings.bot.quote_asset,
+                    "status": "INITIALIZING",
+                    "config_json": settings.bot.model_dump(mode="json"),
+                    "grid_type": settings.bot.grid_type,
+                    "total_capital_quote": settings.bot.total_capital_quote,
+                    "order_quote_value": settings.bot.order_quote_value,
+                    "target_net_profit_quote": settings.bot.target_net_profit_per_cycle_quote,
+                })
+                run_id = run.id
+            short_id = make_run_short_id(run_id)
+            log.info("Friss indítás: bot run létrehozva", run_id=run_id, short_id=short_id)
+            tg.create_task(engine.initialize(run_id, short_id), name="engine_init")
 
         # Várakozás leállítási jelre
         await _shutdown.wait()
@@ -401,7 +499,6 @@ async def main() -> None:
         await watchdog.stop()
         await reconciliation.stop()
 
-        symbol = settings.bot.symbol
         if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
             log.info("Nyitott orderek törlése leállítás előtt", symbol=symbol)
             ws_api.enqueue_cancel_all(symbol)

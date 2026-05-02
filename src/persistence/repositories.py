@@ -167,6 +167,29 @@ class SystemEventRepo:
         self.session.add(event)
 
 
+class GridLevelRepo:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def bulk_upsert(self, bot_run_id: int, levels: list[dict]) -> None:
+        for level_data in levels:
+            stmt = insert(GridLevel).values(
+                bot_run_id=bot_run_id,
+                level_index=level_data["level_index"],
+                price=level_data["price"],
+                side_zone=level_data["side_zone"],
+            ).on_conflict_do_nothing(constraint="uq_grid_level")
+            await self.session.execute(stmt)
+
+    async def load_by_run(self, bot_run_id: int) -> list[GridLevel]:
+        result = await self.session.execute(
+            select(GridLevel)
+            .where(GridLevel.bot_run_id == bot_run_id)
+            .order_by(GridLevel.level_index)
+        )
+        return list(result.scalars().all())
+
+
 class ExternalEventRepo:
     def __init__(self, session: AsyncSession):
         self.session = session
