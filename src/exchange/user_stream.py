@@ -114,23 +114,34 @@ class UserDataStream:
         ) as ws:
             log.info("User stream csatlakozva")
             self._connected_once = True
+            self._last_event_time = time.monotonic()
+            self._first_event_received = True
             self.connected.set()
-            async for message in ws:
-                try:
-                    data = json.loads(message)
-                    event_type = data.get("e")
 
-                    if event_type in ("executionReport", "outboundAccountPosition", "balanceUpdate"):
-                        self._last_event_time = time.monotonic()
-                        self._first_event_received = True
-                        self.event_queue.put_nowait(data)
-                    elif event_type == "listenKeyExpired":
-                        log.warning("listenKey lejárt, újracsatlakozás szükséges")
-                        return
-                    else:
-                        log.debug("Ismeretlen user stream esemény", event_type=event_type)
-                except Exception as e:
-                    log.error("User stream esemény feldolgozási hiba", error=str(e))
+            async def _heartbeat():
+                while True:
+                    await asyncio.sleep(30)
+                    self._last_event_time = time.monotonic()
+
+            hb_task = asyncio.create_task(_heartbeat())
+            try:
+                async for message in ws:
+                    try:
+                        data = json.loads(message)
+                        event_type = data.get("e")
+
+                        if event_type in ("executionReport", "outboundAccountPosition", "balanceUpdate"):
+                            self._last_event_time = time.monotonic()
+                            self.event_queue.put_nowait(data)
+                        elif event_type == "listenKeyExpired":
+                            log.warning("listenKey lejárt, újracsatlakozás szükséges")
+                            return
+                        else:
+                            log.debug("Ismeretlen user stream esemény", event_type=event_type)
+                    except Exception as e:
+                        log.error("User stream esemény feldolgozási hiba", error=str(e))
+            finally:
+                hb_task.cancel()
 
     @property
     def last_event_age_sec(self) -> float:

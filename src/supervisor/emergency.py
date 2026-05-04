@@ -94,8 +94,11 @@ class EmergencyStop:
             try:
                 open_orders = await self.ws_api.get_open_orders(symbol)
                 if not open_orders:
-                    log.info("Minden order törölve, EMERGENCY_STOPPED")
+                    log.info("Minden order törölve")
+                    if self.config.sell_on_emergency_stop:
+                        await self._sell_remaining_base(symbol)
                     self.engine.status = BotStatus.EMERGENCY_STOPPED
+                    log.info("EMERGENCY_STOPPED")
                     if self.engine.bot_run_id:
                         self.db_queue.put_nowait(DbEvent(
                             type="update_bot_status",
@@ -112,7 +115,10 @@ class EmergencyStop:
             except Exception as e:
                 log.error("openOrders.status hiba vészleállításkor", error=str(e))
 
-        # Retry kimerítve
+        # Retry kimerítve – utolsó próba: base eladás ha konfigurálva
+        if self.config.sell_on_emergency_stop:
+            await self._sell_remaining_base(symbol)
+
         log.error("VÉSZLEÁLLÍTÁS BEFEJEZETLEN – kézi beavatkozás szükséges!")
         if self.engine.bot_run_id:
             self.db_queue.put_nowait(DbEvent(
@@ -125,3 +131,35 @@ class EmergencyStop:
                     "payload": {},
                 },
             ))
+
+    async def _sell_remaining_base(self, symbol: str) -> None:
+        """Megmaradt base eszköz eladása piaci áron."""
+        try:
+            account = await self.ws_api.get_account()
+            base_asset = self.engine.settings.bot.base_asset
+            for b in account.get("balances", []):
+                if b["a"] == base_asset:
+                    from decimal import Decimal
+                    free = Decimal(b["f"])
+                    if free <= Decimal("0") or self.engine.symbol_info is None:
+                        break
+                    from exchange.precision import round_down_to_step
+                    qty = round_down_to_step(free, self.engine.symbol_info.lot_size.step_size)
+                    if qty <= 0:
+                        break
+                    cid = f"ESELL-{self.engine.bot_run_id or 0}"
+                    self.ws_api.enqueue_market_sell(symbol, qty, cid)
+                    log.info("Emergency base sell beküldve", asset=base_asset, qty=str(qty))
+                    self.db_queue.put_nowait(DbEvent(
+                        type="log_system_event",
+                        data={
+                            "severity": "WARNING",
+                            "component": "emergency_stop",
+                            "event_type": "emergency_base_sell",
+                            "message": f"Base likvidálás: {qty} {base_asset} piaci áron",
+                            "payload": {"qty": str(qty), "asset": base_asset},
+                        },
+                    ))
+                    break
+        except Exception as e:
+            log.error("Emergency base sell hiba", error=str(e))

@@ -218,6 +218,13 @@ class GridEngine:
                 f"{self.symbol_info.notional.min_notional * Decimal('1.2') * 2:.2f} USDC."
             )
 
+        # Profit/cycle kiszámítása és logolás
+        step = self.grid_plan.grid_step_pct or (self.grid_plan.grid_step_abs / anchor_price if self.grid_plan.grid_step_abs else Decimal("0"))
+        break_even_step = (1 + fb) / (1 - fs) - 1
+        cost_per_cycle = bot.order_quote_value * (1 + fb)
+        revenue_per_cycle = bot.order_quote_value * (1 + step) * (1 - fs)
+        profit_per_cycle = revenue_per_cycle - cost_per_cycle
+
         log.info(
             "Grid generálva",
             type=bot.grid_type,
@@ -226,6 +233,9 @@ class GridEngine:
             order_quote_value=str(bot.order_quote_value),
             quote_needed=str(self.grid_plan.total_quote_required),
             base_needed=str(self.grid_plan.total_base_required),
+            step_pct=f"{step*100:.3f}%",
+            break_even_pct=f"{break_even_step*100:.3f}%",
+            profit_per_cycle=f"{profit_per_cycle:.4f} {bot.quote_asset}",
         )
 
         # Grid map építés – O(1) counter order lookup

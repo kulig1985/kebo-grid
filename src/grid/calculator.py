@@ -46,17 +46,20 @@ class GridCalculator:
         """
         Geometriai grid lépés számítása profit cél alapján.
         r = (1 + fb + π/V) / (1 - fs)
+        Break-even step abszolút padló: a grid SOHA nem lehet veszteséges.
         """
+        break_even_r = (1 + fee_buy) / (1 - fee_sell)
+        break_even_step = break_even_r - 1
+
         if target_profit > 0:
             r = (1 + fee_buy + target_profit / order_quote_value) / (1 - fee_sell)
         else:
-            # Break-even alap (csak díjak fedezése)
-            r = (1 + fee_buy) / (1 - fee_sell)
+            r = break_even_r
 
-        g = r - 1  # grid step percent (pl. 0.004 = 0.4%)
+        g = r - 1
 
-        # Biztonsági korlátok
-        g = max(g, min_step_pct)
+        effective_min = max(min_step_pct, break_even_step)
+        g = max(g, effective_min)
         if g > max_step_pct:
             raise ValueError(
                 f"Szükséges grid step ({g:.6f}) meghaladja max_grid_step_pct={max_step_pct}. "
@@ -77,14 +80,17 @@ class GridCalculator:
         """
         Aritmetikai grid lépés számítása.
         d >= b * ((1 + fb + π/V) / (1 - fs) - 1)
-        Worst case: legmagasabb buy price-nál validálva.
+        Break-even step abszolút padló: a grid SOHA nem lehet veszteséges.
         """
+        break_even_r = (1 + fee_buy) / (1 - fee_sell)
+        break_even_step = break_even_r - 1
+
         numerator = 1 + fee_buy + target_profit / order_quote_value
         d = worst_case_price * (numerator / (1 - fee_sell) - 1)
 
-        # Validálás pct korlátokhoz
         d_pct = d / worst_case_price
-        d_pct = max(d_pct, min_step_pct)
+        effective_min = max(min_step_pct, break_even_step)
+        d_pct = max(d_pct, effective_min)
         if d_pct > max_step_pct:
             raise ValueError(
                 f"Szükséges aritmetikai step ({d_pct:.6f}) meghaladja max_grid_step_pct={max_step_pct}."

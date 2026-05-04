@@ -284,6 +284,31 @@ class BinanceWsApi:
         self.send_queue.put_nowait(cmd)
         return request_id
 
+    def enqueue_market_sell(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        client_order_id: str,
+    ) -> str:
+        """MARKET SELL küldése – base eszköz eladása piaci áron."""
+        request_id = str(uuid.uuid4())
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": str(quantity),
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "ACK",
+        }
+        cmd = WsSendCommand(
+            request_id=request_id,
+            method="order.place",
+            params=params,
+            is_authenticated=True,
+        )
+        self.send_queue.put_nowait(cmd)
+        return request_id
+
     def enqueue_cancel(self, symbol: str, client_order_id: str) -> str:
         """Megbízás törlése queue-ba – non-blocking."""
         request_id = str(uuid.uuid4())

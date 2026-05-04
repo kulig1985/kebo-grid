@@ -535,6 +535,26 @@ async def main() -> None:
             else:
                 log.warning("Nem sikerült az összes ordert törölni leállítás előtt")
 
+            # Base eladás ha konfigurálva van
+            if settings.safety.sell_on_emergency_stop and engine.symbol_info:
+                try:
+                    account = await ws_api.get_account()
+                    base_asset = settings.bot.base_asset
+                    for b in account.get("balances", []):
+                        if b["a"] == base_asset:
+                            free = Decimal(b["f"])
+                            if free > Decimal("0"):
+                                from exchange.precision import round_down_to_step
+                                qty = round_down_to_step(free, engine.symbol_info.lot_size.step_size)
+                                if qty > 0:
+                                    cid = f"GSELL-{engine.bot_run_id or 0}"
+                                    ws_api.enqueue_market_sell(symbol, qty, cid)
+                                    log.info("Graceful shutdown base sell", asset=base_asset, qty=str(qty))
+                                    await asyncio.sleep(2.0)
+                            break
+                except Exception as e:
+                    log.error("Graceful shutdown base sell hiba", error=str(e))
+
         if engine.bot_run_id:
             db_queue.put_nowait(DbEvent(
                 type="update_bot_status",
