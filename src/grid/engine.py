@@ -244,8 +244,9 @@ class GridEngine:
             self.grid_map[level.index] = level
         for level in self.grid_plan.sell_levels:
             self.grid_map[level.index] = level
+        rounded_anchor = round_price_to_tick(anchor_price, self.symbol_info.price_filter.tick_size)
         self.grid_map[0] = GridLevel(
-            index=0, price=anchor_price, side="ANCHOR",
+            index=0, price=rounded_anchor, side="ANCHOR",
             quantity=Decimal("0"), notional=Decimal("0"), zone="ANCHOR",
         )
 
@@ -422,7 +423,7 @@ class GridEngine:
         if grid_line is None:
             log.error("Nincs grid vonal a counter indexhez", counter_index=counter_index, filled_cid=cid)
             return
-        counter_price = grid_line.price
+        counter_price = round_price_to_tick(grid_line.price, self.symbol_info.price_filter.tick_size)
 
         if side == "SELL":
             qty = round_down_to_step(
