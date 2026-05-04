@@ -1,0 +1,60 @@
+exchange:
+  env: mainnet
+  api_key_env: BINANCE_API_KEY
+  secret_key_env: BINANCE_SECRET_KEY
+  recv_window_ms: 10000
+
+bot:
+  symbol: ARBUSDC
+  base_asset: ARB
+  quote_asset: USDC
+
+  total_capital_quote: "50"
+  # order_quote_value: "2.5"       # opcionális – ha nem adod meg, auto-kalkulált
+  target_net_profit_per_cycle_quote: "0.02"
+
+  grid_type: geometric
+  inventory_mode: prebalanced
+  buy_allocation_ratio: "0.5"
+  quote_reserve_pct: "0.02"
+  base_reserve_pct: "0.02"
+  order_type: LIMIT_MAKER
+  time_in_force: GTC
+  max_grid_levels: 20
+  min_grid_step_pct: "0.0025"
+  max_grid_step_pct: "0.05"
+
+bootstrap:
+  order_type: MARKET
+  limit_price_offset_pct: "0.001"
+
+fees:
+  fee_mode: maker_assumed
+  maker_fee_buy: "0.001"
+  maker_fee_sell: "0.001"
+  taker_fee_buy: "0.001"
+  taker_fee_sell: "0.001"
+
+anchor:
+  source: best_bid_ask_mid
+
+safety:
+  external_intervention_policy: pause
+  max_user_stream_staleness_sec: 120
+  max_trading_ws_staleness_sec: 30
+  cancel_retry_interval_sec: 2
+  cancel_retry_max: 5
+  emergency_stop_on_db_queue_full: true
+  emergency_stop_on_balance_mismatch: true
+  sell_on_emergency_stop: false
+  reconciliation_interval_sec: 60
+  profit_report_interval_sec: 600
+
+database:
+  pool_min_size: 1
+  pool_max_size: 10
+  writer_queue_max_size: 10000
+
+logging:
+  level: INFO
+  format: rich

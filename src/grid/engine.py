@@ -423,7 +423,7 @@ class GridEngine:
                  qty=str(report.cumulative_filled_qty),
                  quote=f"{report.cumulative_quote_qty:.2f}",
                  fee=f"{report.commission_amount} {report.commission_asset}",
-                 pair=pair_id, cid=cid)
+                 pair=pair_id)
 
         if side == "BUY":
             counter_index = level_index + 1
@@ -459,8 +459,8 @@ class GridEngine:
 
         log.info("COUNTER", side=counter_side, level=counter_index,
                  price=str(counter_price), qty=str(qty),
-                 notional=f"{qty * counter_price:.2f}",
-                 pair=pair_id, triggered_by=cid)
+                 value=f"{qty * counter_price:.2f}",
+                 pair=pair_id)
 
     async def _execute_bootstrap(self) -> None:
         """Bootstrap: MARKET buy küldése a sell grid orderekhez szükséges base megszerzéséhez."""

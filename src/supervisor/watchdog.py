@@ -43,6 +43,7 @@ class Watchdog:
         self.config = config
         self._running = False
         self._rejection_count = 0
+        self._ws_stale_warned = False
 
     async def run(self) -> None:
         self._running = True
@@ -68,10 +69,14 @@ class Watchdog:
                 )
                 return
 
-        # Trading WS staleness
+        # Trading WS staleness — egyszer figyelmeztet, nem spammel
         ws_age = self.ws_api.last_msg_age_sec
         if ws_age > self.config.max_trading_ws_staleness_sec and self.ws_api.is_connected:
-            log.warning("Trading WS régi utolsó üzenet", age_sec=ws_age)
+            if not self._ws_stale_warned:
+                log.warning("Trading WS régi utolsó üzenet", age_sec=f"{ws_age:.0f}s")
+                self._ws_stale_warned = True
+        else:
+            self._ws_stale_warned = False
 
         # DB writer queue telítettség
         if self.config.emergency_stop_on_db_queue_full:
@@ -84,8 +89,6 @@ class Watchdog:
         # DB degraded állapot
         if self.db_writer.is_degraded:
             log.error("DB writer degraded – DB kapcsolat problémás")
-
-        log.debug("Watchdog OK", user_stream_age=f"{user_stream_age:.1f}s", db_queue=self.db_writer.queue_size)
 
     def record_rejection(self) -> None:
         """Order visszautasítás számlálása."""

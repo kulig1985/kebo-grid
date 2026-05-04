@@ -52,7 +52,7 @@ services:
       retries: 3
       start_period: 10s
     depends_on:
-      bot-solusdc:
+      bot-arbusdc:
         condition: service_healthy
 
   # SOLUSDT bot – API: http://localhost:8081

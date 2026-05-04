@@ -43,11 +43,12 @@ def _grid_event_colorizer(logger, method, event_dict):
     event = event_dict.get("event", "")
 
     if event == "FILL":
-        side = event_dict.get("side", "")
+        side = event_dict.pop("side", "")
         color = _GREEN if side == "BUY" else _RED
         event_dict["event"] = f"{color}■ {side} FILL{_RESET}"
     elif event == "COUNTER":
-        event_dict["event"] = f"{_CYAN}→ COUNTER{_RESET}"
+        side = event_dict.pop("side", "")
+        event_dict["event"] = f"{_CYAN}→ {side} COUNTER{_RESET}"
     elif event == "CYCLE":
         event_dict["event"] = f"{_YELLOW_BOLD}✓ CYCLE{_RESET}"
     elif event == "PROFIT":
