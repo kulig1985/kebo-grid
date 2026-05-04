@@ -461,6 +461,21 @@ async def main() -> None:
         except asyncio.TimeoutError:
             raise RuntimeError("WS API vagy user stream nem csatlakozott 30s alatt!")
 
+        # Szerver idő szinkronizálás – KÖTELEZŐ az első authenticated hívás ELŐTT
+        try:
+            result = await ws_api._query("time", {}, authenticated=False)
+            server_ms = result["serverTime"]
+            local_ms = int(time.time() * 1000)
+            offset = server_ms - local_ms
+            from exchange.signing import set_time_offset
+            set_time_offset(offset)
+            if abs(offset) > 1000:
+                log.warning("Rendszeróra eltérés korrigálva", offset_ms=offset)
+            else:
+                log.info("Szerver idő szinkronizálva", offset_ms=offset)
+        except Exception as e:
+            log.warning("Szerver idő szinkron sikertelen, folytatás", error=str(e))
+
         # Recovery check: van-e bent ragadt order az exchange-en?
         symbol = settings.bot.symbol
         log.info("Open orders lekérdezés...", symbol=symbol)
