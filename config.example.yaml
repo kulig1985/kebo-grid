@@ -106,6 +106,7 @@ safety:
   emergency_stop_on_balance_mismatch: true  # egyenleg eltéréskor vészleállítás
   sell_on_emergency_stop: false         # vészleállításkor eladjuk-e a base-t
   reconciliation_interval_sec: 60       # állapot egyeztetés gyakorisága (másodperc)
+  profit_report_interval_sec: 600      # profit riport gyakorisága (másodperc, 600=10 perc)
 
 # --- Adatbázis (pool beállítások) ---
 database:
@@ -120,5 +121,6 @@ database:
 # --- Naplózás ---
 logging:
   level: INFO                  # DEBUG | INFO | WARNING | ERROR
-  json_format: true            # true: JSON sorok (Docker/monitoring-hoz)
-                               # false: ember-olvasható szöveges log
+  format: rich                 # rich: színes + millis timestamp (fejlesztéshez)
+                               # json: JSON sorok (Docker/monitoring-hoz)
+                               # console: egyszerű szöveges log

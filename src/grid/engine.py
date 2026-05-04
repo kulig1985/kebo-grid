@@ -21,7 +21,7 @@ from exchange.ws_api import BinanceWsApi
 from grid.calculator import GridCalculator, GridLevel, GridPlan
 from grid.inventory import InventoryManager
 from grid.order_router import OrderIntent, OrderRouter, make_client_order_id
-from grid.pnl import CyclePnl, PnlTracker
+from grid.pnl import PnlTracker
 from grid.state_machine import LocalOrderState
 from persistence.writer import DbEvent
 
@@ -81,6 +81,7 @@ class GridEngine:
 
         self._cycle_seq = 0
         self._order_seq = 0
+        self._pair_seq = 0
         self._stop_event = asyncio.Event()
         self._bootstrap_cid: Optional[str] = None
         self._bootstrap_pending = False
@@ -236,6 +237,11 @@ class GridEngine:
             step_pct=f"{step*100:.3f}%",
             break_even_pct=f"{break_even_step*100:.3f}%",
             profit_per_cycle=f"{profit_per_cycle:.4f} {bot.quote_asset}",
+            grid_low=str(self.grid_plan.grid_low_price),
+            grid_high=str(self.grid_plan.grid_high_price),
+            grid_range_pct=f"{((self.grid_plan.grid_high_price / self.grid_plan.grid_low_price - 1) * 100):.1f}%"
+            if self.grid_plan.grid_low_price and self.grid_plan.grid_high_price
+            else "N/A",
         )
 
         # Grid map építés – O(1) counter order lookup
@@ -259,6 +265,8 @@ class GridEngine:
                 "grid_step_pct": self.grid_plan.grid_step_pct,
                 "grid_step_abs": self.grid_plan.grid_step_abs,
                 "order_quote_value": bot.order_quote_value,
+                "grid_low_price": self.grid_plan.grid_low_price,
+                "grid_high_price": self.grid_plan.grid_high_price,
             },
         ))
         levels_to_save = []
@@ -332,7 +340,7 @@ class GridEngine:
 
         log.info("Kezdeti order-ek bekülve (non-blocking)")
 
-    def _submit_level_order(self, level: GridLevel, cycle_id: int) -> str:
+    def _submit_level_order(self, level: GridLevel, cycle_id: int, pair_id: Optional[str] = None) -> str:
         """Egy grid szint order-ét beküldi a routerbe."""
         assert self.router is not None
         self._order_seq += 1
@@ -354,6 +362,7 @@ class GridEngine:
             quantity=level.quantity,
             grid_level_index=level.index,
             quote_value_estimate=level.notional,
+            pair_id=pair_id,
             cycle_id=str(cycle_id),
         )
         self.router.submit_order(intent)
@@ -406,18 +415,22 @@ class GridEngine:
             return
 
         self._cycle_seq += 1
+        self._pair_seq += 1
+        pair_id = f"P-{self._pair_seq:04d}"
+
+        log.info("FILL", side=side, level=level_index,
+                 price=str(report.last_executed_price),
+                 qty=str(report.cumulative_filled_qty),
+                 quote=f"{report.cumulative_quote_qty:.2f}",
+                 fee=f"{report.commission_amount} {report.commission_asset}",
+                 pair=pair_id, cid=cid)
 
         if side == "BUY":
             counter_index = level_index + 1
             counter_side = "SELL"
-            qty = report.cumulative_filled_qty
-            if report.commission_asset == self.settings.bot.base_asset:
-                qty -= report.commission_amount
-            qty = round_down_to_step(qty, self.symbol_info.lot_size.step_size)
         else:
             counter_index = level_index - 1
             counter_side = "BUY"
-            qty = Decimal("0")  # lentebb számítjuk
 
         grid_line = self.grid_map.get(counter_index)
         if grid_line is None:
@@ -425,7 +438,10 @@ class GridEngine:
             return
         counter_price = round_price_to_tick(grid_line.price, self.symbol_info.price_filter.tick_size)
 
-        if side == "SELL":
+        filled_grid_line = self.grid_map.get(level_index)
+        if filled_grid_line and filled_grid_line.quantity > 0:
+            qty = filled_grid_line.quantity
+        else:
             qty = round_down_to_step(
                 self.settings.bot.order_quote_value / counter_price,
                 self.symbol_info.lot_size.step_size,
@@ -439,10 +455,12 @@ class GridEngine:
             notional=qty * counter_price,
             zone="ABOVE_ANCHOR" if counter_price > self.grid_map.get(0, grid_line).price else "BELOW_ANCHOR",
         )
-        self._submit_level_order(counter_level, cycle_id=self._cycle_seq)
-        log.info("Counter order beküldve",
-                 filled_side=side, filled_level=level_index,
-                 counter_side=counter_side, counter_price=str(counter_price), qty=str(qty))
+        self._submit_level_order(counter_level, cycle_id=self._cycle_seq, pair_id=pair_id)
+
+        log.info("COUNTER", side=counter_side, level=counter_index,
+                 price=str(counter_price), qty=str(qty),
+                 notional=f"{qty * counter_price:.2f}",
+                 pair=pair_id, triggered_by=cid)
 
     async def _execute_bootstrap(self) -> None:
         """Bootstrap: MARKET buy küldése a sell grid orderekhez szükséges base megszerzéséhez."""

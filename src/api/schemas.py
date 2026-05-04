@@ -86,9 +86,13 @@ class BalanceResponse(BaseModel):
 
 
 class PnlResponse(BaseModel):
-    total_realized_quote: Decimal
-    completed_cycles: int
-    avg_profit_per_cycle: Decimal
+    grid_profit: Decimal
+    total_buy_fees: Decimal
+    total_sell_fees: Decimal
+    completed_matches: int
+    unmatched_buy_qty: Decimal
+    unmatched_sell_qty: Decimal
+    total_pnl: Decimal
 
 
 class CommandResponse(BaseModel):

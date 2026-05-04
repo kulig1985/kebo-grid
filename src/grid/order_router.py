@@ -125,7 +125,11 @@ class OrderRouter:
             time_in_force=intent.time_in_force,
         )
 
-        log.debug("Order bekülve", cid=intent.client_order_id, side=intent.side, price=str(intent.price))
+        log.info("Order bekülve",
+                 cid=intent.client_order_id, side=intent.side,
+                 level=intent.grid_level_index,
+                 price=str(intent.price), qty=str(intent.quantity),
+                 notional=f"{intent.quote_value_estimate:.2f}")
 
     def submit_cancel(self, symbol: str, client_order_id: str) -> None:
         """Cancel küldése queue-ba – non-blocking."""

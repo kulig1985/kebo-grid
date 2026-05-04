@@ -1,0 +1,12 @@
+api:
+  bot_engine_url: "http://kebo-grid-solusdc:8080"
+  # A bot engine belső API címe (Docker konténer neve a kebo-net hálózaton)
+
+database:
+  pool_min_size: 1
+  pool_max_size: 5
+  # DB kapcsolati adatok (host, port, name, user, password) az .env fájlból jönnek!
+
+logging:
+  level: INFO
+  format: rich     # "json" | "console" | "rich"

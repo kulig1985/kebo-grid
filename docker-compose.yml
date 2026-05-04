@@ -1,5 +1,7 @@
 x-bot-common: &bot-common
-  build: .
+  build:
+    context: .
+    target: bot
   restart: unless-stopped
   env_file: .env
   networks:
@@ -13,14 +15,38 @@ x-bot-common: &bot-common
 
 services:
 
-  # SOLUSDC bot – API: http://localhost:4080
+  # SOLUSDC bot – belső API: http://localhost:8080 (konténeren belül)
   bot-solusdc:
     <<: *bot-common
     container_name: kebo-grid-solusdc
+    volumes:
+      - ./configs/solusdc.yaml:/app/config.yaml:ro
+      - ./logs/solusdc:/app/logs
+
+  # API service – user-facing: http://localhost:4080
+  api:
+    build:
+      context: .
+      target: api
+    container_name: kebo-grid-api
+    restart: unless-stopped
+    env_file: .env
     ports:
       - "4080:8080"
     volumes:
-      - ./configs/solusdc.yaml:/app/config.yaml:ro
+      - ./configs/api.yaml:/app/config.yaml:ro
+      - ./logs/api:/app/logs
+    networks:
+      - kebo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      bot-solusdc:
+        condition: service_healthy
 
   # SOLUSDT bot – API: http://localhost:8081
   # bot-solusdt:
@@ -30,6 +56,7 @@ services:
   #     - "8081:8080"
   #   volumes:
   #     - ./configs/solusdt.yaml:/app/config.yaml:ro
+  #     - ./logs/solusdt:/app/logs
 
   # BTCUSDT bot – API: http://localhost:8082
   # bot-btcusdt:
@@ -39,6 +66,7 @@ services:
   #     - "8082:8080"
   #   volumes:
   #     - ./configs/btcusdt.yaml:/app/config.yaml:ro
+  #     - ./logs/btcusdt:/app/logs
 
 networks:
   kebo-net:

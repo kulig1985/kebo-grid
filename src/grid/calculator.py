@@ -29,6 +29,8 @@ class GridPlan:
     k_sell: int
     total_quote_required: Decimal
     total_base_required: Decimal
+    grid_low_price: Optional[Decimal] = None
+    grid_high_price: Optional[Decimal] = None
 
 
 class GridCalculator:
@@ -212,6 +214,8 @@ class GridCalculator:
             k_sell=len(sell_levels),
             total_quote_required=total_quote,
             total_base_required=total_base,
+            grid_low_price=buy_levels[-1].price if buy_levels else anchor_price,
+            grid_high_price=sell_levels[-1].price if sell_levels else anchor_price,
         )
 
     def generate_arithmetic_grid(
@@ -273,4 +277,6 @@ class GridCalculator:
             k_sell=len(sell_levels),
             total_quote_required=total_quote,
             total_base_required=total_base,
+            grid_low_price=buy_levels[-1].price if buy_levels else anchor_price,
+            grid_high_price=sell_levels[-1].price if sell_levels else anchor_price,
         )

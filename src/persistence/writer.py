@@ -113,6 +113,8 @@ class DbWriter:
                                 grid_step_pct=event.data.get("grid_step_pct"),
                                 grid_step_abs=event.data.get("grid_step_abs"),
                                 order_quote_value=event.data["order_quote_value"],
+                                grid_low_price=event.data.get("grid_low_price"),
+                                grid_high_price=event.data.get("grid_high_price"),
                             )
                         )
 
@@ -130,6 +132,15 @@ class DbWriter:
                     case "log_external_event":
                         repo = ExternalEventRepo(session)
                         await repo.log(event.data)
+
+                    case "update_order_pair_id":
+                        from sqlalchemy import update as sa_update
+                        from .models import Order
+                        await session.execute(
+                            sa_update(Order)
+                            .where(Order.client_order_id == event.data["client_order_id"])
+                            .values(pair_id=event.data["pair_id"])
+                        )
 
                     case "update_intent_state":
                         from sqlalchemy import update as sa_update

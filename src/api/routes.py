@@ -1,14 +1,15 @@
 """
-FastAPI endpoint-ok – read/control API.
+FastAPI endpoint-ok – standalone API service.
 
-Fontos: POST parancs endpoint-ok command queue-ba tesznek,
-NEM futtatnak blokkoló kereskedési műveleteket inline!
+A bot engine-hez HTTP-n keresztül kommunikál (belső API).
+DB lekérdezések közvetlenül az adatbázisból.
 """
-import time
+from decimal import Decimal
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
 
 from api.schemas import (
@@ -16,24 +17,32 @@ from api.schemas import (
     CommandResponse, FillResponse, HealthResponse, OrderResponse,
     PnlResponse, StartBotRequest, WsStatusResponse,
 )
+from grid.pnl import HalfMatch, compute_half_match_profit
 from persistence.db import get_session
 from persistence.models import Balance, BotRun, Fill, Order
 
 router = APIRouter()
 
-# Ezeket a main.py tölti fel startup-kor
-_engine_ref = None
-_ws_api_ref = None
-_user_stream_ref = None
-_emergency_ref = None
-_command_queue_ref = None
-_start_time = time.monotonic()
+_bot_engine_url: str = ""
 
 
-def get_engine():
-    if _engine_ref is None:
-        raise HTTPException(503, "Bot motor nem elérhető")
-    return _engine_ref
+def init_routes(bot_engine_url: str) -> None:
+    global _bot_engine_url
+    _bot_engine_url = bot_engine_url
+
+
+async def _engine_get(path: str) -> dict:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.get(f"{_bot_engine_url}{path}")
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _engine_post(path: str, json_body: dict = None) -> dict:
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        resp = await client.post(f"{_bot_engine_url}{path}", json=json_body)
+        resp.raise_for_status()
+        return resp.json()
 
 
 @router.get("/health", response_model=HealthResponse)
@@ -46,35 +55,55 @@ async def health():
 
 @router.get("/status", response_model=BotStatusResponse)
 async def status():
-    engine = get_engine()
-    plan = engine.grid_plan
-    return BotStatusResponse(
-        status=engine.status,
-        bot_run_id=engine.bot_run_id,
-        symbol=engine.settings.bot.symbol,
-        uptime_sec=time.monotonic() - _start_time,
-        open_orders=len(engine._level_orders),
-        grid_levels={
-            "buy": plan.k_buy if plan else 0,
-            "sell": plan.k_sell if plan else 0,
-        },
-    )
+    try:
+        data = await _engine_get("/internal/status")
+        return BotStatusResponse(
+            status=data["bot_status"],
+            bot_run_id=data.get("bot_run_id"),
+            symbol=data["symbol"],
+            uptime_sec=data.get("uptime_sec"),
+            open_orders=data.get("open_orders", 0),
+            grid_levels=data.get("grid", {}),
+        )
+    except Exception:
+        async with get_session() as session:
+            result = await session.execute(
+                select(BotRun).order_by(BotRun.id.desc()).limit(1)
+            )
+            run = result.scalar_one_or_none()
+        return BotStatusResponse(
+            status=run.status if run else "UNKNOWN",
+            bot_run_id=run.id if run else None,
+            symbol=run.symbol if run else "",
+            uptime_sec=None,
+            open_orders=0,
+            grid_levels={},
+        )
 
 
 @router.get("/ws/status", response_model=WsStatusResponse)
 async def ws_status():
-    ws = _ws_api_ref
-    us = _user_stream_ref
-    return WsStatusResponse(
-        trading_ws_connected=ws.is_connected if ws else False,
-        user_stream_connected=True,  # nincs közvetlen is_connected a stream-en
-        trading_ws_last_msg_age_sec=ws.last_msg_age_sec if ws else -1,
-        user_stream_last_event_age_sec=us.last_event_age_sec if us else -1,
-        reconnect_counts={
-            "trading_ws": ws._reconnect_count if ws else 0,
-            "user_stream": us._reconnect_count if us else 0,
-        },
-    )
+    try:
+        data = await _engine_get("/internal/status")
+        ws = data.get("ws", {})
+        return WsStatusResponse(
+            trading_ws_connected=ws.get("trading_connected", False),
+            user_stream_connected=True,
+            trading_ws_last_msg_age_sec=ws.get("trading_last_msg_age", -1),
+            user_stream_last_event_age_sec=ws.get("user_stream_last_event_age", -1),
+            reconnect_counts={
+                "trading_ws": ws.get("reconnects_trading", 0),
+                "user_stream": ws.get("reconnects_user_stream", 0),
+            },
+        )
+    except Exception:
+        return WsStatusResponse(
+            trading_ws_connected=False,
+            user_stream_connected=False,
+            trading_ws_last_msg_age_sec=-1,
+            user_stream_last_event_age_sec=-1,
+            reconnect_counts={"trading_ws": 0, "user_stream": 0},
+        )
 
 
 @router.get("/bot/runs", response_model=list[BotRunResponse])
@@ -151,65 +180,92 @@ async def get_balances(run_id: int):
 
 @router.get("/bot/runs/{run_id}/pnl", response_model=PnlResponse)
 async def get_pnl(run_id: int):
-    engine = get_engine()
-    if engine.bot_run_id != run_id:
-        raise HTTPException(404, "PnL csak az aktív bot run-ra elérhető")
-    summary = engine.pnl.summary()
+    async with get_session() as session:
+        result = await session.execute(
+            select(Fill).where(Fill.bot_run_id == run_id).order_by(Fill.id)
+        )
+        fills_db = result.scalars().all()
+
+    if not fills_db:
+        return PnlResponse(
+            grid_profit=Decimal("0"),
+            total_buy_fees=Decimal("0"),
+            total_sell_fees=Decimal("0"),
+            completed_matches=0,
+            unmatched_buy_qty=Decimal("0"),
+            unmatched_sell_qty=Decimal("0"),
+            total_pnl=Decimal("0"),
+        )
+
+    half_matches = [
+        HalfMatch(
+            fill_id=f.id,
+            side=f.side,
+            price=f.price,
+            quantity=f.quantity,
+            quote_qty=f.quote_quantity,
+            commission=f.commission_amount,
+            commission_asset=f.commission_asset or "",
+            remaining=f.quantity,
+        )
+        for f in fills_db
+    ]
+
+    report = compute_half_match_profit(half_matches)
+
     return PnlResponse(
-        total_realized_quote=summary["total_realized_quote"],
-        completed_cycles=summary["completed_cycles"],
-        avg_profit_per_cycle=summary["avg_profit_per_cycle"],
+        grid_profit=report.grid_profit,
+        total_buy_fees=report.total_buy_fees,
+        total_sell_fees=report.total_sell_fees,
+        completed_matches=report.completed_matches,
+        unmatched_buy_qty=report.unmatched_buy_qty,
+        unmatched_sell_qty=report.unmatched_sell_qty,
+        total_pnl=report.total_pnl,
     )
 
 
-# --- Control endpoint-ok – queue-ba tesznek, NEM blokkolnak ---
+# --- Control endpoint-ok – HTTP forward a bot engine-hez ---
 
 @router.post("/bot/start", response_model=CommandResponse)
 async def start_bot(request: StartBotRequest):
-    if _command_queue_ref is None:
-        raise HTTPException(503, "Command queue nem elérhető")
-    _command_queue_ref.put_nowait({"cmd": "start", "data": request.model_dump()})
-    return CommandResponse(accepted=True, message="Start parancs fogadva")
+    try:
+        await _engine_post("/internal/cmd", {"cmd": "start", "data": request.model_dump()})
+        return CommandResponse(accepted=True, message="Start parancs fogadva")
+    except Exception as e:
+        raise HTTPException(502, f"Bot engine nem elérhető: {e}")
 
 
 @router.post("/bot/pause", response_model=CommandResponse)
 async def pause_bot():
-    if _command_queue_ref is None:
-        raise HTTPException(503, "Command queue nem elérhető")
-    _command_queue_ref.put_nowait({"cmd": "pause"})
-    return CommandResponse(accepted=True, message="Pause parancs fogadva")
+    try:
+        await _engine_post("/internal/cmd", {"cmd": "pause"})
+        return CommandResponse(accepted=True, message="Pause parancs fogadva")
+    except Exception as e:
+        raise HTTPException(502, f"Bot engine nem elérhető: {e}")
 
 
 @router.post("/bot/resume", response_model=CommandResponse)
 async def resume_bot():
-    if _command_queue_ref is None:
-        raise HTTPException(503, "Command queue nem elérhető")
-    _command_queue_ref.put_nowait({"cmd": "resume"})
-    return CommandResponse(accepted=True, message="Resume parancs fogadva")
+    try:
+        await _engine_post("/internal/cmd", {"cmd": "resume"})
+        return CommandResponse(accepted=True, message="Resume parancs fogadva")
+    except Exception as e:
+        raise HTTPException(502, f"Bot engine nem elérhető: {e}")
 
 
 @router.post("/bot/stop", response_model=CommandResponse)
 async def stop_bot():
-    if _command_queue_ref is None:
-        raise HTTPException(503, "Command queue nem elérhető")
-    _command_queue_ref.put_nowait({"cmd": "stop"})
-    return CommandResponse(accepted=True, message="Stop parancs fogadva")
+    try:
+        await _engine_post("/internal/cmd", {"cmd": "stop"})
+        return CommandResponse(accepted=True, message="Stop parancs fogadva")
+    except Exception as e:
+        raise HTTPException(502, f"Bot engine nem elérhető: {e}")
 
 
 @router.post("/bot/emergency-stop", response_model=CommandResponse)
 async def emergency_stop():
-    """Vészleállítás – azonnal visszatér, a végrehajtás async."""
-    if _command_queue_ref is None:
-        raise HTTPException(503, "Command queue nem elérhető")
-    _command_queue_ref.put_nowait({"cmd": "emergency_stop", "reason": "API kérelem"})
-    return CommandResponse(accepted=True, message="Vészleállítás parancs fogadva")
-
-
-def init_routes(engine, ws_api, user_stream, emergency, command_queue):
-    """Globális referenciák beállítása startup-kor."""
-    global _engine_ref, _ws_api_ref, _user_stream_ref, _emergency_ref, _command_queue_ref
-    _engine_ref = engine
-    _ws_api_ref = ws_api
-    _user_stream_ref = user_stream
-    _emergency_ref = emergency
-    _command_queue_ref = command_queue
+    try:
+        await _engine_post("/internal/cmd", {"cmd": "emergency_stop", "reason": "API kérelem"})
+        return CommandResponse(accepted=True, message="Vészleállítás parancs fogadva")
+    except Exception as e:
+        raise HTTPException(502, f"Bot engine nem elérhető: {e}")

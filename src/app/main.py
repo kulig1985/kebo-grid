@@ -1,24 +1,13 @@
 """
-Főprogram – összes async task indítása és koordinálása.
+Főprogram – grid bot engine + minimális belső HTTP.
 
-Task-ok:
-1. trading_ws_writer_task
-2. trading_ws_reader_task
-3. user_stream_task
-4. event_dispatcher_task
-5. db_writer_task
-6. reconciliation_task
-7. watchdog_task
-8. command_processor_task
-9. api_server_task
-10. broadcast_task (frontend WebSocket)
+Az API külön service-ben fut (api_main.py).
+A belső HTTP csak health check és parancs fogadásra szolgál.
 """
 import asyncio
 import signal
 import sys
 import time
-import uuid
-from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Optional
 
@@ -38,19 +27,16 @@ from persistence.models import BotRun
 from persistence.repositories import BotRunRepo, GridLevelRepo
 from persistence.writer import DbEvent, DbWriter
 from supervisor.emergency import EmergencyStop
+from supervisor.profit_reporter import ProfitReporter
 from supervisor.reconciliation import Reconciliation
 from supervisor.watchdog import Watchdog
-from api.routes import init_routes, router as api_router
-from api.live_events import broadcast_loop, set_broadcast_queue, websocket_events, publish_event
 
 log = get_logger(__name__)
 
-# Globális leállítás jelző
 _shutdown = asyncio.Event()
 
 
 def make_run_short_id(run_id: int) -> str:
-    """6 karakteres base36 azonosító a bot run-hoz."""
     chars = "0123456789abcdefghijklmnopqrstuvwxyz"
     n = run_id
     result = []
@@ -61,7 +47,6 @@ def make_run_short_id(run_id: int) -> str:
 
 
 def parse_run_short_id(short: str) -> int:
-    """short_id-ból visszaállítja a bot_run.id-t (make_run_short_id inverze)."""
     chars = "0123456789abcdefghijklmnopqrstuvwxyz"
     n = 0
     for c in short:
@@ -74,13 +59,7 @@ async def event_dispatcher(
     db_queue: asyncio.Queue[DbEvent],
     engine: GridEngine,
 ) -> None:
-    """
-    Esemény diszpécser – user data stream eseményeket fogad és irányít.
-
-    DB írás SOHA nem itt, csak queue-ba tesz.
-    """
     local_cancels: set[str] = set()
-
     log.info("Event dispatcher elindult")
 
     while True:
@@ -117,9 +96,6 @@ async def event_dispatcher(
                 delta = Decimal(data["d"])
                 engine.inventory.update_from_balance_update(asset, delta)
 
-            # Live broadcast
-            publish_event({"type": event_type, "data": data})
-
         except Exception as e:
             log.error("Event dispatcher hiba", event_type=event_type, error=str(e))
 
@@ -133,7 +109,6 @@ async def _handle_execution_report(
     bot_run_id: int,
     local_cancels: set[str],
 ) -> None:
-    """executionReport feldolgozása."""
     try:
         report = ExecutionReport.from_dict(data)
     except Exception as e:
@@ -142,7 +117,6 @@ async def _handle_execution_report(
 
     cid = report.client_order_id
 
-    # Nem a bot által küldött order → csak naplózzuk, nem dolgozzuk fel
     if not cid.startswith("G-"):
         log.debug("Nem-bot order event kihagyva", cid=cid, status=report.order_status)
         db_queue.put_nowait(DbEvent(
@@ -164,15 +138,12 @@ async def _handle_execution_report(
         return
 
     has_local_cancel = cid in local_cancels
-    # Emergency stop közben minden CANCELED a sajátunk
     if engine.status in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED") and report.execution_type == "CANCELED":
         has_local_cancel = True
 
-    # Állapotgép átmenet
     current = LocalOrderState.SUBMITTED_UNKNOWN
     new_state, external = transition_from_execution_report(current, report, has_local_cancel)
 
-    # DB queue: execution event (idempotens)
     db_queue.put_nowait(DbEvent(
         type="insert_execution_event",
         data={
@@ -190,7 +161,6 @@ async def _handle_execution_report(
         },
     ))
 
-    # DB queue: order frissítés
     db_queue.put_nowait(DbEvent(
         type="update_order_from_execution",
         data={
@@ -207,7 +177,6 @@ async def _handle_execution_report(
         },
     ))
 
-    # Fill mentés ha trade esemény
     if report.execution_type == "TRADE" and report.trade_id >= 0:
         db_queue.put_nowait(DbEvent(
             type="insert_fill",
@@ -230,11 +199,9 @@ async def _handle_execution_report(
             },
         ))
 
-    # Grid motor értesítése
     if report.order_status == "FILLED":
         await engine.on_execution_report(report)
 
-    # Külső beavatkozás kezelése
     if external:
         await engine.on_external_cancel(report)
         db_queue.put_nowait(DbEvent(
@@ -257,7 +224,6 @@ async def command_processor(
     engine: GridEngine,
     emergency: EmergencyStop,
 ) -> None:
-    """API parancsok feldolgozása."""
     while True:
         try:
             cmd = await asyncio.wait_for(command_queue.get(), timeout=1.0)
@@ -282,7 +248,6 @@ async def command_processor(
 
 
 async def run_migrations() -> None:
-    """Alembic migrációk futtatása startup-kor – táblákat ez hozza létre."""
     from alembic.config import Config as AlembicConfig
     from alembic import command as alembic_command
 
@@ -310,7 +275,6 @@ async def _try_recovery(
     bot_orders: list[dict],
     db_queue: asyncio.Queue,
 ) -> None:
-    """Megpróbálja a korábbi run-t folytatni a bent ragadt orderekből."""
     from persistence.db import get_session
 
     first_cid = bot_orders[0]["clientOrderId"]
@@ -347,7 +311,6 @@ async def _try_recovery(
             ws_api.enqueue_cancel_all(symbol)
             return
 
-    # exchangeInfo lekérés (precision filterek kellenek)
     info_data = await ws_api.get_exchange_info(symbol)
     symbols = info_data.get("symbols", [])
     sym_data = next((s for s in symbols if s["symbol"] == symbol), None)
@@ -357,7 +320,6 @@ async def _try_recovery(
         return
     symbol_info = SymbolInfo.from_exchange_info(sym_data)
 
-    # Recovery végrehajtás
     await engine.recover(
         bot_run_id=run_id,
         bot_run_short_id=run6,
@@ -367,7 +329,6 @@ async def _try_recovery(
         symbol_info=symbol_info,
     )
 
-    # Bot run status frissítés DB-ben
     db_queue.put_nowait(DbEvent(
         type="update_bot_status",
         data={"run_id": run_id, "status": "RUNNING"},
@@ -375,16 +336,67 @@ async def _try_recovery(
     log.info("Recovery sikeres, bot fut", run_id=run_id)
 
 
+def _create_internal_app(
+    engine: GridEngine,
+    ws_api: BinanceWsApi,
+    user_stream: UserDataStream,
+    command_queue: asyncio.Queue,
+) -> FastAPI:
+    """Minimális belső HTTP — health + status + cmd."""
+    app = FastAPI(title="Kebo Grid Internal", docs_url=None, redoc_url=None)
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
+    @app.get("/internal/status")
+    async def internal_status():
+        plan = engine.grid_plan
+        grid_info = {}
+        if plan:
+            grid_info = {
+                "buy": plan.k_buy,
+                "sell": plan.k_sell,
+                "low_price": str(plan.grid_low_price) if plan.grid_low_price else None,
+                "high_price": str(plan.grid_high_price) if plan.grid_high_price else None,
+            }
+        return {
+            "bot_status": engine.status,
+            "bot_run_id": engine.bot_run_id,
+            "symbol": engine.settings.bot.symbol,
+            "open_orders": len(engine._level_orders),
+            "grid": grid_info,
+            "uptime_sec": time.monotonic() - _boot_time,
+            "ws": {
+                "trading_connected": ws_api.is_connected,
+                "trading_last_msg_age": ws_api.last_msg_age_sec,
+                "user_stream_last_event_age": user_stream.last_event_age_sec,
+                "reconnects_trading": ws_api._reconnect_count,
+                "reconnects_user_stream": user_stream._reconnect_count,
+            },
+        }
+
+    @app.post("/internal/cmd")
+    async def internal_cmd(body: dict):
+        command_queue.put_nowait(body)
+        return {"accepted": True}
+
+    return app
+
+
+_boot_time = time.monotonic()
+
+
 async def main() -> None:
-    # Konfig betöltés
+    global _boot_time
+    _boot_time = time.monotonic()
+
     config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     settings = load_config(config_file)
 
-    setup_logging(settings.logging.level, settings.logging.json_format)
+    setup_logging(settings.logging.level, settings.logging.format)
     log.info("Kebo Grid Bot indul", config=config_file)
 
-    # DB inicializálás + auto migráció
-    # (Időszinkron a WS kapcsolat felépülése után történik a ws_api.writer_loop()-ban)
     init_db(settings.database)
     await run_migrations()
 
@@ -393,9 +405,6 @@ async def main() -> None:
     event_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
     db_queue: asyncio.Queue[DbEvent] = asyncio.Queue(maxsize=settings.database.writer_queue_max_size)
     command_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-    broadcast_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-
-    set_broadcast_queue(broadcast_queue)
 
     # Komponensek
     ws_api = BinanceWsApi(settings.exchange, ws_send_queue, db_queue)
@@ -405,7 +414,7 @@ async def main() -> None:
         on_reconnect=lambda: asyncio.get_event_loop().create_task(
             log.ainfo("User stream reconnect – reconciliation szükséges")
         ),
-        ws_api=ws_api,  # WS API fallback ha REST /api/v3/userDataStream nem elérhető
+        ws_api=ws_api,
     )
     market_stream = MarketStream(settings.exchange, settings.bot.symbol)
     engine = GridEngine(settings, ws_api, db_queue, event_queue, market_stream=market_stream)
@@ -413,16 +422,10 @@ async def main() -> None:
     emergency = EmergencyStop(engine, ws_api, db_queue, settings.safety)
     reconciliation = Reconciliation(engine, ws_api, db_queue, settings.safety)
     watchdog = Watchdog(engine, ws_api, user_stream, db_writer, emergency, settings.safety)
+    profit_reporter = ProfitReporter(engine, settings.safety.profit_report_interval_sec)
 
-    # FastAPI app
-    app = FastAPI(title="Kebo Grid Bot API")
-    app.include_router(api_router)
-
-    @app.websocket("/api/events")
-    async def ws_events(websocket):
-        await websocket_events(websocket)
-
-    init_routes(engine, ws_api, user_stream, emergency, command_queue)
+    # Belső HTTP (health + status + cmd)
+    internal_app = _create_internal_app(engine, ws_api, user_stream, command_queue)
 
     # SIGINT/SIGTERM handler
     def handle_signal():
@@ -433,25 +436,22 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, handle_signal)
 
-    # Uvicorn konfig
-    uv_config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="warning")
+    uv_config = uvicorn.Config(internal_app, host="0.0.0.0", port=8080, log_level="warning")
     uv_server = uvicorn.Server(uv_config)
 
-    # Minden task indítása
     async with asyncio.TaskGroup() as tg:
         tg.create_task(ws_api.writer_loop(), name="ws_writer")
         tg.create_task(ws_api.reader_loop(), name="ws_reader")
         tg.create_task(user_stream.start(), name="user_stream")
-        tg.create_task(market_stream.start(), name="market_stream")  # anchor price-hoz
+        tg.create_task(market_stream.start(), name="market_stream")
         tg.create_task(db_writer.run(), name="db_writer")
         tg.create_task(event_dispatcher(event_queue, db_queue, engine), name="event_dispatcher")
         tg.create_task(command_processor(command_queue, engine, emergency), name="cmd_processor")
         tg.create_task(reconciliation.run(), name="reconciliation")
         tg.create_task(watchdog.run(), name="watchdog")
-        tg.create_task(broadcast_loop(), name="broadcast")
-        tg.create_task(uv_server.serve(), name="api_server")
+        tg.create_task(profit_reporter.run(), name="profit_reporter")
+        tg.create_task(uv_server.serve(), name="internal_http")
 
-        # Inicializáció: ELŐBB connection, AZTÁN recovery check, AZTÁN döntés
         log.info("Várakozás WS API és user stream csatlakozásra...")
         try:
             await asyncio.wait_for(ws_api._connected.wait(), timeout=30.0)
@@ -461,7 +461,6 @@ async def main() -> None:
         except asyncio.TimeoutError:
             raise RuntimeError("WS API vagy user stream nem csatlakozott 30s alatt!")
 
-        # Szerver idő szinkronizálás – KÖTELEZŐ az első authenticated hívás ELŐTT
         try:
             result = await ws_api._query("time", {}, authenticated=False)
             server_ms = result["serverTime"]
@@ -476,7 +475,6 @@ async def main() -> None:
         except Exception as e:
             log.warning("Szerver idő szinkron sikertelen, folytatás", error=str(e))
 
-        # Recovery check: van-e bent ragadt order az exchange-en?
         symbol = settings.bot.symbol
         log.info("Open orders lekérdezés...", symbol=symbol)
         existing_orders = await ws_api.get_open_orders(symbol)
@@ -486,7 +484,6 @@ async def main() -> None:
             await _try_recovery(engine, ws_api, settings, bot_orders, db_queue)
 
         if engine.status == "INITIALIZING":
-            # Friss indítás: bot_run létrehozás + engine.initialize()
             from persistence.db import get_session
             async with get_session() as session:
                 repo = BotRunRepo(session)
@@ -506,20 +503,33 @@ async def main() -> None:
             log.info("Friss indítás: bot run létrehozva", run_id=run_id, short_id=short_id)
             tg.create_task(engine.initialize(run_id, short_id), name="engine_init")
 
-        # Várakozás leállítási jelre
         await _shutdown.wait()
         log.info("Leállítás...")
 
-        # Graceful shutdown: előbb orderek törlése, aztán kapcsolatok bontása
         await watchdog.stop()
         await reconciliation.stop()
+        await profit_reporter.stop()
 
         if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
-            log.info("Nyitott orderek törlése leállítás előtt", symbol=symbol)
+            try:
+                pre_cancel = await asyncio.wait_for(ws_api.get_open_orders(symbol), timeout=3.0)
+                bot_orders_open = [o for o in pre_cancel if o.get("clientOrderId", "").startswith("G-")]
+                ext_orders_open = [o for o in pre_cancel if not o.get("clientOrderId", "").startswith("G-")]
+                log.info("Leállítás: nyitott orderek törlése",
+                         symbol=symbol,
+                         bot_orders=len(bot_orders_open),
+                         external_orders=len(ext_orders_open),
+                         total=len(pre_cancel))
+                for o in bot_orders_open:
+                    log.debug("Törlendő bot order",
+                              cid=o.get("clientOrderId"), side=o.get("side"),
+                              price=o.get("price"), qty=o.get("origQty"))
+            except Exception:
+                log.info("Nyitott orderek törlése leállítás előtt", symbol=symbol)
+
             ws_api.enqueue_cancel_all(symbol)
             engine.status = "STOPPED"
 
-            # Várunk a cancelAll végrehajtására (max 5s)
             for _ in range(10):
                 await asyncio.sleep(0.5)
                 try:
@@ -535,7 +545,6 @@ async def main() -> None:
             else:
                 log.warning("Nem sikerült az összes ordert törölni leállítás előtt")
 
-            # Base eladás ha konfigurálva van
             if settings.safety.sell_on_emergency_stop and engine.symbol_info:
                 try:
                     account = await ws_api.get_account()

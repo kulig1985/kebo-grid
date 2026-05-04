@@ -25,6 +25,9 @@ build/
 venv/
 .eggs/
 
+# Logok
+logs/
+
 # OS
 .DS_Store
 Thumbs.db

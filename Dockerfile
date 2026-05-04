@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Rendszer függőségek
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev \
+    gcc libpq-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Python függőségek
@@ -17,7 +17,6 @@ COPY alembic/ ./alembic/
 COPY alembic.ini .
 
 # Üres config.yaml fájl létrehozása – kötelező, hogy Docker fájlként mountolhassa!
-# (Ha ez hiányzik, Docker könyvtárat csinál belőle és mount sikertelen.)
 RUN touch /app/config.yaml
 
 ENV PYTHONPATH=/app/src
@@ -25,4 +24,10 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
+# --- Bot engine target ---
+FROM base AS bot
 CMD ["python", "src/app/main.py", "config.yaml"]
+
+# --- API target ---
+FROM base AS api
+CMD ["python", "src/app/api_main.py", "config.yaml"]

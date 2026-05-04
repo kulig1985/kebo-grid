@@ -91,7 +91,7 @@ class ExecutionReport:
     """User data stream executionReport esemény."""
     event_time: int           # E
     symbol: str               # s
-    client_order_id: str      # c
+    client_order_id: str      # c / C (CANCELED-nél origClientOrderId)
     side: str                 # S  BUY | SELL
     order_type: str           # o
     time_in_force: str        # f
@@ -117,10 +117,18 @@ class ExecutionReport:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ExecutionReport":
+        # CANCELED/EXPIRED: "c" = cancel kérelem ID (Binance generált),
+        # "C" = eredeti order clientOrderId (a mi "G-..." ID-nk)
+        exec_type = d.get("x", "")
+        if exec_type in ("CANCELED", "EXPIRED") and d.get("C"):
+            cid = d["C"]
+        else:
+            cid = d["c"]
+
         return cls(
             event_time=d["E"],
             symbol=d["s"],
-            client_order_id=d["c"],
+            client_order_id=cid,
             side=d["S"],
             order_type=d["o"],
             time_in_force=d["f"],

@@ -157,6 +157,7 @@ class SafetyConfig(BaseModel):
     emergency_stop_on_balance_mismatch: bool = True
     sell_on_emergency_stop: bool = False
     reconciliation_interval_sec: int = 60
+    profit_report_interval_sec: int = 600
 
 
 class DatabaseConfig(BaseModel):
@@ -207,7 +208,11 @@ class DatabaseConfig(BaseModel):
 
 class LoggingConfig(BaseModel):
     level: str = "INFO"
-    json_format: bool = True  # json volt, de ütközött a Pydantic BaseModel.json() metódusával
+    format: str = "rich"  # "json" | "console" | "rich"
+
+
+class ApiConfig(BaseModel):
+    bot_engine_url: str = "http://bot-solusdc:8080"
 
 
 class Settings(BaseModel):
@@ -219,6 +224,7 @@ class Settings(BaseModel):
     safety: SafetyConfig = SafetyConfig()
     database: DatabaseConfig = DatabaseConfig()
     logging: LoggingConfig = LoggingConfig()
+    api: ApiConfig = ApiConfig()
 
     @model_validator(mode="after")
     def validate_settings(self) -> "Settings":
