@@ -324,7 +324,7 @@ class GridEngine:
         # Buy order-ek
         for level in self.grid_plan.buy_levels:
             if not self.inventory.has_quote_for_buy(level.notional):
-                log.warning("Nincs elég quote a buy order-hez", level=level.index, price=str(level.price))
+                log.warning("Nincs elég quote a buy order-hez", lvl=level.index, price=str(level.price))
                 continue
             self._submit_level_order(level, cycle_id=0)
 
@@ -332,7 +332,7 @@ class GridEngine:
         if bot.inventory_mode in ("prebalanced", "use_existing_balances"):
             for level in self.grid_plan.sell_levels:
                 if not self.inventory.has_base_for_sell(level.quantity):
-                    log.warning("Nincs elég base a sell order-hez", level=level.index)
+                    log.warning("Nincs elég base a sell order-hez", lvl=level.index)
                     break
                 self._submit_level_order(level, cycle_id=0)
         elif bot.inventory_mode == "quote_only_bootstrap":
@@ -418,11 +418,11 @@ class GridEngine:
         self._pair_seq += 1
         pair_id = f"P-{self._pair_seq:04d}"
 
-        log.info("FILL", side=side, level=level_index,
-                 price=str(report.last_executed_price),
-                 qty=str(report.cumulative_filled_qty),
+        log.info("FILL", side=side, lvl=level_index,
+                 price=report.last_executed_price.normalize(),
+                 qty=report.cumulative_filled_qty.normalize(),
                  quote=f"{report.cumulative_quote_qty:.2f}",
-                 fee=f"{report.commission_amount} {report.commission_asset}",
+                 fee=f"{float(report.commission_amount):.4f} {report.commission_asset}",
                  pair=pair_id)
 
         if side == "BUY":
@@ -457,8 +457,8 @@ class GridEngine:
         )
         self._submit_level_order(counter_level, cycle_id=self._cycle_seq, pair_id=pair_id)
 
-        log.info("COUNTER", side=counter_side, level=counter_index,
-                 price=str(counter_price), qty=str(qty),
+        log.info("COUNTER", side=counter_side, lvl=counter_index,
+                 price=counter_price.normalize(), qty=qty.normalize(),
                  value=f"{qty * counter_price:.2f}",
                  pair=pair_id)
 
