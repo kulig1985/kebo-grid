@@ -16,12 +16,19 @@ x-bot-common: &bot-common
 services:
 
   # SOLUSDC bot – belső API: http://localhost:8080 (konténeren belül)
-  bot-solusdc:
+#  bot-solusdc:
+#    <<: *bot-common
+#    container_name: kebo-grid-solusdc
+#    volumes:
+#      - ./configs/solusdc.yaml:/app/config.yaml:ro
+#      - ./logs/solusdc:/app/logs
+
+  bot-arbusdc:
     <<: *bot-common
-    container_name: kebo-grid-solusdc
+    container_name: kebo-grid-arbusdc
     volumes:
-      - ./configs/solusdc.yaml:/app/config.yaml:ro
-      - ./logs/solusdc:/app/logs
+      - ./configs/arbusdc.yaml:/app/config.yaml:ro
+      - ./logs/arbusdc:/app/logs
 
   # API service – user-facing: http://localhost:4080
   api:
