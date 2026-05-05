@@ -114,8 +114,15 @@ class BootstrapConfig(BaseModel):
 
     quote_qty: Optional[Decimal] = None
     # Mennyi USDT-ért vásárol SOL-t a bootstrap lépésben.
-    # None = automatikus: total_capital_quote × buy_allocation_ratio
-    # Pl. 50 USDT tőke, 0.5 arány → 25 USDT-ért vesz SOL-t
+    # None = automatikus számítás a sell oldali grid base-igényéből:
+    #   required_base = sum(sell_level.qty)
+    #   gross_base    = required_base × (1 + base_buffer_pct) / (1 - fee_buy)
+    #   quote_qty     = gross_base × anchor_price
+    # Csak annyit vesz, ami a sell grid orderekhez kell — nem keletkezik felesleges idle base.
+
+    base_buffer_pct: Decimal = Decimal("0.05")
+    # Biztonsági ráhagyás a kalkulált base-igény fölé (5% default).
+    # Lefedi a market fill csúszást, fee-eltérést, kerekítést.
 
     limit_price_offset_pct: Decimal = Decimal("0.001")
     # LIMIT/LIMIT_MAKER bootstrap esetén: az anchor ár alá annyival

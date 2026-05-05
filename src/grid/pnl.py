@@ -44,15 +44,17 @@ class ProfitReport:
     completed_matches: int
     unmatched_buy_qty: Decimal
     unmatched_sell_qty: Decimal
-    unrealized_base_value: Decimal
-    total_pnl: Decimal
+    portfolio_quote: Decimal     # wallet_base × current_price + wallet_quote
+    total_pnl: Decimal           # portfolio_quote − initial_capital_quote
     matches: list[MatchedPair] = field(default_factory=list)
 
 
 def compute_half_match_profit(
     fills: list[HalfMatch],
     current_price: Decimal = Decimal("0"),
-    initial_investment: Decimal = Decimal("0"),
+    initial_capital_quote: Decimal = Decimal("0"),
+    wallet_base: Decimal = Decimal("0"),
+    wallet_quote: Decimal = Decimal("0"),
 ) -> ProfitReport:
     buys = [HalfMatch(
         fill_id=f.fill_id, side=f.side, price=f.price,
@@ -106,13 +108,13 @@ def compute_half_match_profit(
         b.remaining -= match_qty
         s.remaining -= match_qty
 
-    grid_profit = sum(m.net_profit for m in matches)
-    total_buy_fees = sum(m.buy_fee for m in matches)
-    total_sell_fees = sum(m.sell_fee for m in matches)
-    unmatched_buy_qty = sum(b.remaining for b in buys if b.remaining > 0)
-    unmatched_sell_qty = sum(s.remaining for s in sells if s.remaining > 0)
-    unrealized = unmatched_buy_qty * current_price
-    total_pnl = grid_profit + unrealized - initial_investment
+    grid_profit = sum((m.net_profit for m in matches), Decimal("0"))
+    total_buy_fees = sum((m.buy_fee for m in matches), Decimal("0"))
+    total_sell_fees = sum((m.sell_fee for m in matches), Decimal("0"))
+    unmatched_buy_qty = sum((b.remaining for b in buys if b.remaining > 0), Decimal("0"))
+    unmatched_sell_qty = sum((s.remaining for s in sells if s.remaining > 0), Decimal("0"))
+    portfolio_quote = wallet_base * current_price + wallet_quote
+    total_pnl = portfolio_quote - initial_capital_quote
 
     return ProfitReport(
         grid_profit=grid_profit,
@@ -121,7 +123,7 @@ def compute_half_match_profit(
         completed_matches=len(matches),
         unmatched_buy_qty=unmatched_buy_qty,
         unmatched_sell_qty=unmatched_sell_qty,
-        unrealized_base_value=unrealized,
+        portfolio_quote=portfolio_quote,
         total_pnl=total_pnl,
         matches=matches,
     )

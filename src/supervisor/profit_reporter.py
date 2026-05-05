@@ -1,4 +1,4 @@
-"""Periodikus profit riport — half-match engine alapon."""
+"""Periodikus profit riport — half-match engine + portfolio-mark-to-market."""
 import asyncio
 import time
 from decimal import Decimal
@@ -63,17 +63,31 @@ class ProfitReporter:
         if self.engine.market_stream and self.engine.market_stream.mid_price:
             current_price = self.engine.market_stream.mid_price
 
-        initial = sum(hm.quote_qty for hm in half_matches if hm.side == "BUY")
-        report = compute_half_match_profit(half_matches, current_price, initial)
+        bot = self.engine.settings.bot
+        snapshot = self.engine.inventory.snapshot()
+        wallet_base = snapshot.get(bot.base_asset, Decimal("0"))
+        wallet_quote = snapshot.get(bot.quote_asset, Decimal("0"))
+        initial_capital = bot.total_capital_quote
+
+        report = compute_half_match_profit(
+            half_matches,
+            current_price=current_price,
+            initial_capital_quote=initial_capital,
+            wallet_base=wallet_base,
+            wallet_quote=wallet_quote,
+        )
 
         elapsed_h = (time.monotonic() - self._start_time) / 3600
-        per_hour = report.grid_profit / Decimal(str(elapsed_h)) if elapsed_h > Decimal("0.01") else Decimal("0")
+        per_hour = report.grid_profit / Decimal(str(elapsed_h)) if elapsed_h > 0.01 else Decimal("0")
 
-        log.info("PROFIT",
-                 grid_profit=f"{report.grid_profit:.4f}",
-                 matches=report.completed_matches,
-                 per_hour=f"{per_hour:.4f}",
-                 unmatched_buy=f"{report.unmatched_buy_qty:.6f}",
-                 unmatched_sell=f"{report.unmatched_sell_qty:.6f}",
-                 total_pnl=f"{report.total_pnl:.4f}",
-                 hours=f"{elapsed_h:.1f}")
+        log.info(
+            "PROFIT",
+            realized=f"{report.grid_profit:.4f}",
+            matches=report.completed_matches,
+            per_hour=f"{per_hour:.4f}",
+            portfolio=f"{report.portfolio_quote:.2f}",
+            total_pnl=f"{report.total_pnl:.4f}",
+            open_base=wallet_base.normalize(),
+            open_quote=f"{wallet_quote:.2f}",
+            hours=f"{elapsed_h:.1f}",
+        )

@@ -39,20 +39,67 @@ _YELLOW_BOLD = "\033[1;33m"
 _MAGENTA_BOLD = "\033[1;35m"
 
 
+_LINE = "─" * 60
+
+
 def _grid_event_colorizer(logger, method, event_dict):
     event = event_dict.get("event", "")
 
     if event == "FILL":
         side = event_dict.pop("side", "")
+        lvl = event_dict.pop("lvl", "")
+        price = event_dict.pop("price", "")
+        qty = event_dict.pop("qty", "")
+        quote = event_dict.pop("quote", "")
+        fee = event_dict.pop("fee", "")
+        filled_at = event_dict.pop("filled_at", "")
+        pair = event_dict.pop("pair", "")
         color = _GREEN if side == "BUY" else _RED
-        event_dict["event"] = f"{color}■ {side} FILL{_RESET}"
+        event_dict["event"] = (
+            f"\n{_DIM}{_LINE}{_RESET}\n"
+            f"{color}{_BOLD}■ {side} FILL{_RESET}       "
+            f"{_DIM}{pair}{_RESET}  lvl {_BOLD}{lvl}{_RESET}\n"
+            f"  price {_BOLD}{price}{_RESET}   qty {qty}   quote {quote}\n"
+            f"  fee {fee}   filled {_DIM}{filled_at}{_RESET}"
+        )
+
     elif event == "COUNTER":
         side = event_dict.pop("side", "")
-        event_dict["event"] = f"{_CYAN}→ {side} COUNTER{_RESET}"
+        lvl = event_dict.pop("lvl", "")
+        price = event_dict.pop("price", "")
+        qty = event_dict.pop("qty", "")
+        value = event_dict.pop("value", "")
+        sent_at = event_dict.pop("sent_at", "")
+        latency_ms = event_dict.pop("latency_ms", "")
+        event_dict.pop("pair", None)
+        event_dict["event"] = (
+            f"  {_CYAN}→ {side} COUNTER{_RESET}   lvl {_BOLD}{lvl}{_RESET}\n"
+            f"    price {_BOLD}{price}{_RESET}   qty {qty}   value {value}\n"
+            f"    sent {_DIM}{sent_at}{_RESET}   latency {_DIM}{latency_ms}ms{_RESET}\n"
+            f"{_DIM}{_LINE}{_RESET}"
+        )
+
+    elif event == "PROFIT":
+        realized = event_dict.pop("realized", "")
+        matches = event_dict.pop("matches", "")
+        per_hour = event_dict.pop("per_hour", "")
+        portfolio = event_dict.pop("portfolio", "")
+        total_pnl = event_dict.pop("total_pnl", "")
+        open_base = event_dict.pop("open_base", "")
+        open_quote = event_dict.pop("open_quote", "")
+        hours = event_dict.pop("hours", "")
+        pnl_color = _RED if str(total_pnl).startswith("-") else _GREEN
+        event_dict["event"] = (
+            f"\n{_DIM}{_LINE}{_RESET}\n"
+            f"{_MAGENTA_BOLD}$ PROFIT{_RESET}  {_DIM}{hours}h{_RESET}\n"
+            f"  realized {_BOLD}{realized}{_RESET}   ({matches} matches, {per_hour}/h)\n"
+            f"  portfolio {_BOLD}{portfolio}{_RESET} USDT   total_pnl {pnl_color}{_BOLD}{total_pnl}{_RESET} USDT\n"
+            f"  open base {open_base}   open quote {open_quote}\n"
+            f"{_DIM}{_LINE}{_RESET}"
+        )
+
     elif event == "CYCLE":
         event_dict["event"] = f"{_YELLOW_BOLD}✓ CYCLE{_RESET}"
-    elif event == "PROFIT":
-        event_dict["event"] = f"{_MAGENTA_BOLD}$ PROFIT{_RESET}"
     elif event == "Order bekülve":
         event_dict["event"] = f"{_DIM}Order bekülve{_RESET}"
     elif method in ("error", "critical"):
@@ -136,7 +183,7 @@ def setup_logging(level: str = "INFO", fmt: str = "rich") -> None:
             structlog.processors.ExceptionRenderer(),
             _grid_event_colorizer,
             _file_writer_processor,
-            structlog.dev.ConsoleRenderer(colors=True, pad_event=50),
+            structlog.dev.ConsoleRenderer(colors=True, pad_event=0),
         ])
     else:
         processors.extend([

@@ -311,6 +311,22 @@ async def _try_recovery(
             ws_api.enqueue_cancel_all(symbol)
             return
 
+        from sqlalchemy import select, func
+        from persistence.models import Order
+        max_pair_seq = 0
+        result = await session.execute(
+            select(func.max(Order.pair_id)).where(
+                Order.bot_run_id == run_id,
+                Order.pair_id.isnot(None),
+            )
+        )
+        max_pair_str = result.scalar_one_or_none()
+        if max_pair_str and max_pair_str.startswith("P-"):
+            try:
+                max_pair_seq = int(max_pair_str[2:])
+            except ValueError:
+                max_pair_seq = 0
+
     info_data = await ws_api.get_exchange_info(symbol)
     symbols = info_data.get("symbols", [])
     sym_data = next((s for s in symbols if s["symbol"] == symbol), None)
@@ -327,6 +343,7 @@ async def _try_recovery(
         grid_levels_db=grid_levels,
         open_orders=bot_orders,
         symbol_info=symbol_info,
+        max_pair_seq=max_pair_seq,
     )
 
     db_queue.put_nowait(DbEvent(

@@ -9,6 +9,7 @@ Felelős:
 """
 import asyncio
 import time
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -26,6 +27,12 @@ from grid.state_machine import LocalOrderState
 from persistence.writer import DbEvent
 
 log = get_logger(__name__)
+
+
+def _ms_to_timestr(ms: int) -> str:
+    """Binance epoch ms → 'HH:MM:SS.mmm' (UTC)."""
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
 
 
 class BotStatus(str):
@@ -423,6 +430,7 @@ class GridEngine:
                  qty=report.cumulative_filled_qty.normalize(),
                  quote=f"{report.cumulative_quote_qty:.2f}",
                  fee=f"{float(report.commission_amount):.4f} {report.commission_asset}",
+                 filled_at=_ms_to_timestr(report.transaction_time),
                  pair=pair_id)
 
         if side == "BUY":
@@ -457,9 +465,12 @@ class GridEngine:
         )
         self._submit_level_order(counter_level, cycle_id=self._cycle_seq, pair_id=pair_id)
 
+        sent_ms = int(time.time() * 1000)
         log.info("COUNTER", side=counter_side, lvl=counter_index,
                  price=counter_price.normalize(), qty=qty.normalize(),
                  value=f"{qty * counter_price:.2f}",
+                 sent_at=_ms_to_timestr(sent_ms),
+                 latency_ms=sent_ms - report.transaction_time,
                  pair=pair_id)
 
     async def _execute_bootstrap(self) -> None:
@@ -470,7 +481,29 @@ class GridEngine:
 
         quote_qty = bootstrap.quote_qty
         if quote_qty is None:
-            quote_qty = bot.total_capital_quote * bot.buy_allocation_ratio
+            if self.grid_plan and self.grid_plan.sell_levels:
+                required_base = sum(
+                    (lv.quantity for lv in self.grid_plan.sell_levels),
+                    Decimal("0"),
+                )
+                buffer = bootstrap.base_buffer_pct
+                fee_buy = self.settings.fees.effective_buy_fee
+                gross_base = required_base * (Decimal("1") + buffer) / (Decimal("1") - fee_buy)
+                quote_qty = (gross_base * self.grid_plan.anchor_price).quantize(Decimal("0.01"))
+                log.info(
+                    "Bootstrap quote_qty kalkulált",
+                    k_sell=len(self.grid_plan.sell_levels),
+                    required_base=str(required_base),
+                    buffer_pct=str(buffer),
+                    gross_base=str(gross_base),
+                    quote_qty=str(quote_qty),
+                )
+            else:
+                quote_qty = bot.total_capital_quote * bot.buy_allocation_ratio
+                log.warning(
+                    "Bootstrap fallback: nincs sell_levels — total_capital × buy_allocation_ratio",
+                    quote_qty=str(quote_qty),
+                )
 
         self._order_seq += 1
         cid = f"G-{self._bot_run_short_id}-BOOT-{self._order_seq:04d}"
@@ -582,6 +615,7 @@ class GridEngine:
         grid_levels_db: list,
         open_orders: list[dict],
         symbol_info: SymbolInfo,
+        max_pair_seq: int = 0,
     ) -> None:
         """
         Recovery: bent ragadt orderekből újraépíti a grid állapotot.
@@ -681,6 +715,13 @@ class GridEngine:
                 max_seq = max(max_seq, int(parts[5]))
         self._cycle_seq = max_cycle + 1
         self._order_seq = max_seq + 1
+        self._pair_seq = max_pair_seq
+        log.info(
+            "Sequence counters visszaállítva",
+            cycle_seq=self._cycle_seq,
+            order_seq=self._order_seq,
+            pair_seq=self._pair_seq,
+        )
 
         # Account frissítés
         account_data = await self.ws_api.get_account()
