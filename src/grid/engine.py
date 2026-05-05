@@ -178,9 +178,9 @@ class GridEngine:
         if bot.grid_type == "geometric":
             step = self.calculator.compute_geometric_step(
                 bot.order_quote_value,
+                bot.target_profit_pct,
                 bot.target_net_profit_per_cycle_quote,
                 fb, fs,
-                bot.min_grid_step_pct,
                 bot.max_grid_step_pct,
             )
             k_buy, k_sell = self.calculator.compute_grid_counts(
@@ -201,9 +201,9 @@ class GridEngine:
             worst_buy_price = anchor_price  # legmagasabb buy szint közel az anchor-hoz
             step = self.calculator.compute_arithmetic_step(
                 bot.order_quote_value,
+                bot.target_profit_pct,
                 bot.target_net_profit_per_cycle_quote,
                 fb, fs, worst_buy_price,
-                bot.min_grid_step_pct,
                 bot.max_grid_step_pct,
             )
             k_buy, k_sell = self.calculator.compute_grid_counts(

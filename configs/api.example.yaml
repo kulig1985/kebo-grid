@@ -1,12 +1,16 @@
+# API service config — DB read-only + opcionális élő bot proxy
 api:
-  bot_engine_url: "http://kebo-grid-arbusdc:8080"
-  # A bot engine belső API címe (Docker konténer neve a kebo-net hálózaton)
+  bot_engine_url: "http://kebo-grid-tiausdc:8080"
+  # ⬇ A bot engine belső API címe (Docker konténer neve : 8080).
+  # /status és parancsok élőben innen jönnek. Ha nem elérhető → DB fallback.
+  # Több bot esetén ez az EGY bot, amit az API "élesnek" tekint;
+  # a többi bot adata DB-ből olvasható (read-only).
 
 database:
   pool_min_size: 1
   pool_max_size: 5
-  # DB kapcsolati adatok (host, port, name, user, password) az .env fájlból jönnek!
+  # DB kapcsolati adatok (DB_HOST, DB_PORT, ...) az .env fájlból.
 
 logging:
   level: INFO
-  format: rich     # "json" | "console" | "rich"
+  format: rich     # rich | json | console

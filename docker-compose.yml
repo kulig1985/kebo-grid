@@ -23,14 +23,17 @@ services:
 #      - ./configs/solusdc.yaml:/app/config.yaml:ro
 #      - ./logs/solusdc:/app/logs
 
-  bot-arbusdc:
+  bot-tiausdc:
     <<: *bot-common
-    container_name: kebo-grid-arbusdc
+    container_name: kebo-grid-tiausdc
     volumes:
-      - ./configs/arbusdc.yaml:/app/config.yaml:ro
-      - ./logs/arbusdc:/app/logs
+      - ./configs/tiausdc.yaml:/app/config.yaml:ro
+      - ./logs/tiausdc:/app/logs
 
   # API service – user-facing: http://localhost:4080
+  # NEM dependál konkrét bot konténerre — önállóan indul.
+  # Ha egy bot nem érhető el, a /status DB fallback-ot ad.
+  # A configurált bot_engine_url az api.yaml-ben állítható (élő bot-status és parancsok).
   api:
     build:
       context: .
@@ -51,9 +54,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
-    depends_on:
-      bot-arbusdc:
-        condition: service_healthy
 
   # SOLUSDT bot – API: http://localhost:8081
   # bot-solusdt:

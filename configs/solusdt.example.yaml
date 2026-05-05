@@ -72,14 +72,9 @@ bot:
   # Maximum grid szintek száma összesen (buy + sell).
   # Ha nincs megadva order_quote_value: ez határozza meg egy szint méretét is.
 
-  min_grid_step_pct: "0.0025"
-  # ▶ BIZTONSÁGI ALSÓ KORLÁT – nem a tényleges lépés!
-  # Ha a számított lépés kisebb lenne ennél (0.25%), ez az érték lép életbe.
-  # Célja: megakadályozni a túl szoros gridekat ahol slippage eliminálja a profitot.
-
   max_grid_step_pct: "0.05"
-  # ▶ BIZTONSÁGI FELSŐ KORLÁT – ha a számított lépés meghaladja ezt (5%),
-  # a bot HIBÁVAL ÁLL LE induláskor. Valószínűleg elírás van a konfigban.
+  # SANITY CHECK: ha a számolt step >5%, a bot HIBÁVAL leáll induláskor.
+  # Az alsó korlát automatikusan a break-even step (fee_buy + fee_sell összege).
 
 bootstrap:
   # Csak inventory_mode: quote_only_bootstrap esetén aktív

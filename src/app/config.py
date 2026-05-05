@@ -53,12 +53,26 @@ class BotConfig(BaseModel):
     #   order_quote_value = (total_capital_quote × (1 - quote_reserve_pct)) / max_grid_levels
     # Ha megadod: validálja, hogy belefér a tőkébe és legalább 2 szint létrejöhet.
 
+    target_profit_pct: Optional[Decimal] = None
+    # Minimum NETTÓ profit EGY BUY-SELL CIKLUSON — az order_quote_value (egy grid vonal USDT
+    # értéke) %-ában. NEM a total_capital-ra vetítve!
+    #
+    # Képlet: r = (1 + π) / ((1 - fee_buy) × (1 - fee_sell))
+    # Profit / cycle ≈ order_quote_value × target_profit_pct
+    #
+    # PÉLDA: order_quote_value=5.5 USDT, target_profit_pct=0.005 (0.5%)
+    #        → ciklus profit ≈ 5.5 × 0.005 = 0.0275 USDT (~2.75 cent / matched pair)
+    #
+    # ⚠ HASZNÁLD EZT VAGY a target_net_profit_per_cycle_quote-ot — egyszerre csak EGYIKET.
+
     target_net_profit_per_cycle_quote: Decimal = Decimal("0.02")
-    # Minimálisan elvárt NETTÓ profit egy buy-sell körön (USDT-ben).
-    # Ebből SZÁMOLJA a rendszer a szükséges grid lépés %-ot:
-    #   r = (1 + fee_buy + profit/order_value) / (1 - fee_sell)
-    # Minél nagyobb, annál ritkábbak a szintek (de több profit körvonként).
-    # Minél kisebb, annál sűrűbb a grid (de kisebb profit).
+    # Minimum NETTÓ profit egy buy-sell körön — USDT-ben (abszolút). Default: 0.02 USDT/cycle.
+    # Pl. 0.02 = 2 cent / ciklus minden szintre azonos.
+    #
+    # Képlet: r = (1 + fee_buy + profit_usdt / order_quote_value) / (1 - fee_sell)
+    # Minden szinten ugyanaz az USDT profit, de a %-os hozam szintenként eltérő (lentebb nagyobb %).
+    #
+    # Ha target_profit_pct meg van adva, ez a mező ignorált.
 
     grid_type: Literal["geometric", "arithmetic"] = "geometric"
     inventory_mode: Literal["prebalanced", "quote_only_bootstrap", "use_existing_balances"] = "prebalanced"
@@ -68,12 +82,25 @@ class BotConfig(BaseModel):
     order_type: Literal["LIMIT_MAKER", "LIMIT"] = "LIMIT_MAKER"
     time_in_force: str = "GTC"
     max_grid_levels: int = 20
-    min_grid_step_pct: Decimal = Decimal("0.0025")
     max_grid_step_pct: Decimal = Decimal("0.05")
+    # Sanity check: ha a számított lépés meghaladja ezt (5%), a bot HIBÁVAL leáll induláskor.
+    # Védelem elgépelés ellen — pl. véletlenül 0.5 kerül 0.005 helyett a profit célba.
+
     buy_side_order_count: Optional[int] = None
     sell_side_order_count: Optional[int] = None
     external_intervention_policy: Literal["pause", "continue_reconcile", "emergency_stop"] = "pause"
     stop_policy: Literal["cancel_orders_only", "cancel_orders_and_optionally_liquidate_base"] = "cancel_orders_only"
+
+    @model_validator(mode="after")
+    def validate_target_profit(self) -> "BotConfig":
+        """target_profit_pct VAGY target_net_profit_per_cycle_quote — pozitív érték."""
+        pct = self.target_profit_pct
+        quote = self.target_net_profit_per_cycle_quote
+        if pct is not None and pct <= 0:
+            raise ValueError("target_profit_pct pozitív kell legyen")
+        if quote is not None and quote <= 0:
+            raise ValueError("target_net_profit_per_cycle_quote pozitív kell legyen")
+        return self
 
     @model_validator(mode="after")
     def validate_order_quote_value(self) -> "BotConfig":

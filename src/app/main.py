@@ -513,7 +513,8 @@ async def main() -> None:
                     "grid_type": settings.bot.grid_type,
                     "total_capital_quote": settings.bot.total_capital_quote,
                     "order_quote_value": settings.bot.order_quote_value,
-                    "target_net_profit_quote": settings.bot.target_net_profit_per_cycle_quote,
+                    "target_net_profit_quote": settings.bot.target_net_profit_per_cycle_quote
+                    or settings.bot.target_profit_pct,
                 })
                 run_id = run.id
             short_id = make_run_short_id(run_id)

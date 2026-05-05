@@ -21,8 +21,7 @@ bot:
   order_type: LIMIT_MAKER
   time_in_force: GTC
   max_grid_levels: 20
-  min_grid_step_pct: "0.0025"
-  max_grid_step_pct: "0.05"
+  max_grid_step_pct: "0.05"  # sanity check: ha számolt step >5% → bot leáll
 
 bootstrap:
   order_type: MARKET

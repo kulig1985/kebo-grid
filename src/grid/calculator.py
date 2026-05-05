@@ -39,29 +39,35 @@ class GridCalculator:
     def compute_geometric_step(
         self,
         order_quote_value: Decimal,
-        target_profit: Decimal,
+        target_profit_pct: Optional[Decimal],
+        target_profit_quote: Optional[Decimal],
         fee_buy: Decimal,
         fee_sell: Decimal,
-        min_step_pct: Decimal,
         max_step_pct: Decimal,
     ) -> Decimal:
         """
         Geometriai grid lépés számítása profit cél alapján.
-        r = (1 + fb + π/V) / (1 - fs)
-        Break-even step abszolút padló: a grid SOHA nem lehet veszteséges.
+
+        Ha target_profit_pct van:
+            r = (1 + π_pct) / ((1 - fb) × (1 - fs))   — % alapú nettó profit
+        Ha target_profit_quote van:
+            r = (1 + fb + π_quote / V) / (1 - fs)     — abszolút USDT profit / ciklus
+
+        Break-even step (fee-k összege) az abszolút padló — sosem lehet veszteséges.
         """
         break_even_r = (1 + fee_buy) / (1 - fee_sell)
         break_even_step = break_even_r - 1
 
-        if target_profit > 0:
-            r = (1 + fee_buy + target_profit / order_quote_value) / (1 - fee_sell)
+        if target_profit_pct is not None and target_profit_pct > 0:
+            r = (Decimal("1") + target_profit_pct) / ((Decimal("1") - fee_buy) * (Decimal("1") - fee_sell))
+        elif target_profit_quote is not None and target_profit_quote > 0:
+            r = (Decimal("1") + fee_buy + target_profit_quote / order_quote_value) / (Decimal("1") - fee_sell)
         else:
             r = break_even_r
 
         g = r - 1
+        g = max(g, break_even_step)
 
-        effective_min = max(min_step_pct, break_even_step)
-        g = max(g, effective_min)
         if g > max_step_pct:
             raise ValueError(
                 f"Szükséges grid step ({g:.6f}) meghaladja max_grid_step_pct={max_step_pct}. "
@@ -72,27 +78,32 @@ class GridCalculator:
     def compute_arithmetic_step(
         self,
         order_quote_value: Decimal,
-        target_profit: Decimal,
+        target_profit_pct: Optional[Decimal],
+        target_profit_quote: Optional[Decimal],
         fee_buy: Decimal,
         fee_sell: Decimal,
         worst_case_price: Decimal,
-        min_step_pct: Decimal,
         max_step_pct: Decimal,
     ) -> Decimal:
         """
         Aritmetikai grid lépés számítása.
-        d >= b * ((1 + fb + π/V) / (1 - fs) - 1)
-        Break-even step abszolút padló: a grid SOHA nem lehet veszteséges.
+
+        A %-os vagy USDT-s target_profit-ból egy r szorzót kapunk, abból:
+            d = worst_case_price × (r - 1)
+        Break-even step a fee-k összege — abszolút padló.
         """
         break_even_r = (1 + fee_buy) / (1 - fee_sell)
         break_even_step = break_even_r - 1
 
-        numerator = 1 + fee_buy + target_profit / order_quote_value
-        d = worst_case_price * (numerator / (1 - fee_sell) - 1)
+        if target_profit_pct is not None and target_profit_pct > 0:
+            r = (Decimal("1") + target_profit_pct) / ((Decimal("1") - fee_buy) * (Decimal("1") - fee_sell))
+        elif target_profit_quote is not None and target_profit_quote > 0:
+            r = (Decimal("1") + fee_buy + target_profit_quote / order_quote_value) / (Decimal("1") - fee_sell)
+        else:
+            r = break_even_r
 
-        d_pct = d / worst_case_price
-        effective_min = max(min_step_pct, break_even_step)
-        d_pct = max(d_pct, effective_min)
+        d_pct = max(r - 1, break_even_step)
+
         if d_pct > max_step_pct:
             raise ValueError(
                 f"Szükséges aritmetikai step ({d_pct:.6f}) meghaladja max_grid_step_pct={max_step_pct}."
