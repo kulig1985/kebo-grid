@@ -196,6 +196,16 @@ class GridEngine:
         fb = fees.effective_buy_fee
         fs = fees.effective_sell_fee
 
+        # Bootstrap quote-igény becslése (tényleges per-sell költség: V * (1+buffer) / (1-fee))
+        bootstrap_per_sell = Decimal("0")
+        if bot.inventory_mode == "quote_only_bootstrap" and self.settings.bootstrap.quote_qty is None:
+            buffer = self.settings.bootstrap.base_buffer_pct
+            bootstrap_per_sell = (
+                bot.order_quote_value
+                * (Decimal("1") + buffer)
+                / (Decimal("1") - fb)
+            )
+
         if bot.grid_type == "geometric":
             step = self.calculator.compute_geometric_step(
                 bot.order_quote_value,
@@ -212,6 +222,7 @@ class GridEngine:
                 bot.max_grid_levels,
                 bot.buy_side_order_count,
                 bot.sell_side_order_count,
+                bootstrap_quote_per_sell=bootstrap_per_sell,
             )
             self.grid_plan = self.calculator.generate_geometric_grid(
                 anchor_price, step, k_buy, k_sell,
@@ -231,6 +242,7 @@ class GridEngine:
                 bot.total_capital_quote, bot.order_quote_value,
                 bot.quote_reserve_pct, bot.buy_allocation_ratio,
                 bot.max_grid_levels, bot.buy_side_order_count, bot.sell_side_order_count,
+                bootstrap_quote_per_sell=bootstrap_per_sell,
             )
             self.grid_plan = self.calculator.generate_arithmetic_grid(
                 anchor_price, step, k_buy, k_sell,
