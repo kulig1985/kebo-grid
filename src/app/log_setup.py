@@ -98,6 +98,93 @@ def _grid_event_colorizer(logger, method, event_dict):
             f"{_DIM}{_LINE}{_RESET}"
         )
 
+    elif event == "GRID_TABLE":
+        symbol = event_dict.pop("symbol", "")
+        gtype = event_dict.pop("type", "")
+        anchor = event_dict.pop("anchor", "")
+        step_pct = event_dict.pop("step_pct", "")
+        break_even_pct = event_dict.pop("break_even_pct", "")
+        grid_low = event_dict.pop("grid_low", "")
+        grid_high = event_dict.pop("grid_high", "")
+        grid_range_pct = event_dict.pop("grid_range_pct", "")
+        k_buy = event_dict.pop("k_buy", 0)
+        k_sell = event_dict.pop("k_sell", 0)
+        order_quote_value = event_dict.pop("order_quote_value", "")
+        profit_per_cycle = event_dict.pop("profit_per_cycle", "")
+        quote_needed = event_dict.pop("quote_needed", "")
+        base_needed = event_dict.pop("base_needed", "")
+        rows = event_dict.pop("rows", [])
+        base_asset = event_dict.pop("base_asset", "")
+        quote_asset = event_dict.pop("quote_asset", "")
+
+        lines = [
+            "",
+            f"{_DIM}{_LINE}{_RESET}",
+            f"{_YELLOW_BOLD}🎯 GRID GENERÁLVA{_RESET}  {_BOLD}{symbol}{_RESET}  {_DIM}{gtype}{_RESET}",
+            f"  anchor {_BOLD}{anchor}{_RESET}   step {_BOLD}{step_pct}{_RESET}   "
+            f"break-even {_DIM}{break_even_pct}{_RESET}",
+            f"  range {grid_low} → {grid_high}  ({grid_range_pct})   "
+            f"szintek: {k_buy} BUY / {k_sell} SELL",
+            f"  per-line {order_quote_value}   profit/cycle {_GREEN}{profit_per_cycle}{_RESET}",
+            f"  igényel: {quote_needed}  +  {base_needed}",
+            f"{_DIM}  ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─{_RESET}",
+        ]
+        for idx, side, price, qty, notional in rows:
+            if side == "ANCHOR":
+                lines.append(
+                    f"{_DIM}  ━━━━━ anchor {_BOLD}{price}{_RESET}{_DIM} ━━━━━{_RESET}"
+                )
+            else:
+                color = _RED if side == "SELL" else _GREEN
+                sign = "+" if idx > 0 else ""
+                lines.append(
+                    f"  {color}{side:4s}{_RESET} {sign}{idx:>3}  "
+                    f"price {_BOLD}{price}{_RESET}  "
+                    f"qty {qty.normalize() if hasattr(qty, 'normalize') else qty}  "
+                    f"notional {notional:.2f} {quote_asset}"
+                )
+        lines.append(f"{_DIM}{_LINE}{_RESET}")
+        event_dict["event"] = "\n".join(lines)
+
+    elif event == "INIT_ORDER":
+        side = event_dict.pop("side", "")
+        lvl = event_dict.pop("lvl", "")
+        price = event_dict.pop("price", "")
+        qty = event_dict.pop("qty", "")
+        notional = event_dict.pop("notional", "")
+        quote_asset = event_dict.pop("quote_asset", "")
+        event_dict.pop("cid", None)
+        color = _GREEN if side == "BUY" else _RED
+        sign = "+" if isinstance(lvl, int) and lvl > 0 else ""
+        event_dict["event"] = (
+            f"  {color}→ {side:4s}{_RESET} {sign}{lvl:>3}  "
+            f"price {_BOLD}{price}{_RESET}  qty {qty}  "
+            f"notional {notional} {quote_asset}"
+        )
+
+    elif event == "MISSED":
+        side = event_dict.pop("side", "")
+        lvl = event_dict.pop("lvl", "")
+        price = event_dict.pop("price", "")
+        reason = event_dict.pop("reason", "")
+        event_dict["event"] = (
+            f"{_YELLOW_BOLD}⚠ MISSED {side}{_RESET}  "
+            f"lvl {_BOLD}{lvl}{_RESET}  price {_BOLD}{price}{_RESET}  "
+            f"{_DIM}({reason}){_RESET}"
+        )
+
+    elif event == "MISSED_RETRY":
+        side = event_dict.pop("side", "")
+        lvl = event_dict.pop("lvl", "")
+        price = event_dict.pop("price", "")
+        retry = event_dict.pop("retry", "")
+        mid = event_dict.pop("mid", "")
+        event_dict["event"] = (
+            f"{_CYAN}↻ MISSED RETRY {side}{_RESET}  "
+            f"lvl {_BOLD}{lvl}{_RESET}  price {_BOLD}{price}{_RESET}  "
+            f"retry #{retry}  {_DIM}mid={mid}{_RESET}"
+        )
+
     elif event == "CYCLE":
         event_dict["event"] = f"{_YELLOW_BOLD}✓ CYCLE{_RESET}"
     elif event == "Order bekülve":

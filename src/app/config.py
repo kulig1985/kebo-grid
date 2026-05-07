@@ -185,11 +185,18 @@ class SafetyConfig(BaseModel):
     external_intervention_policy: Literal["pause", "continue_reconcile", "emergency_stop"] = "pause"
     max_user_stream_staleness_sec: int = 120
     max_trading_ws_staleness_sec: int = 30
+    max_trading_ws_idle_force_close_sec: int = 300
+    # 5 perc: ha a trading WS connected==True de ennyi ideje nincs üzenet,
+    # a watchdog force close-olja → auto-reconnect. 3 egymás utáni → emergency stop.
     cancel_retry_interval_sec: int = 2
     cancel_retry_max: int = 5
     emergency_stop_on_db_queue_full: bool = True
     emergency_stop_on_balance_mismatch: bool = True
     sell_on_emergency_stop: bool = False
+    shutdown_action: Literal["cancel_only", "cancel_and_sell", "force_exit"] = "cancel_only"
+    # cancel_only      — minden ordert töröl, base bent marad
+    # cancel_and_sell  — orderek + base MARKET sell, tiszta exit (REST fallback ha WS halott)
+    # force_exit       — gyors kilépés, semmi cleanup (vész esetére)
     reconciliation_interval_sec: int = 60
     profit_report_interval_sec: int = 600
 

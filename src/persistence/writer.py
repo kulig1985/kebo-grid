@@ -151,6 +151,18 @@ class DbWriter:
                             .values(local_state=event.data["state"])
                         )
 
+                    case "update_order_local_state":
+                        from sqlalchemy import update as sa_update
+                        from .models import Order
+                        values = {"status_local": event.data["state"]}
+                        if event.data.get("reject_reason"):
+                            values["reject_reason"] = event.data["reject_reason"][:100]
+                        await session.execute(
+                            sa_update(Order)
+                            .where(Order.client_order_id == event.data["client_order_id"])
+                            .values(**values)
+                        )
+
                     case _:
                         log.warning("Ismeretlen DbEvent típus", event_type=event.type)
 

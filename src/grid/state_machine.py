@@ -25,6 +25,7 @@ class LocalOrderState(str, Enum):
     UNKNOWN = "UNKNOWN"
     ORPHANED = "ORPHANED"
     ERROR = "ERROR"
+    MISSED = "MISSED"   # post-only reject vagy EXPIRED — várja a maker-szafe ár visszatérését
 
 
 # Terminal állapotok – ezekből nem lehet tovább haladni

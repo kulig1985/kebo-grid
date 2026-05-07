@@ -201,6 +201,8 @@ async def _handle_execution_report(
 
     if report.order_status == "FILLED":
         await engine.on_execution_report(report)
+    elif report.execution_type in ("REJECTED", "EXPIRED") or report.order_status in ("REJECTED", "EXPIRED"):
+        await engine.on_order_rejected(report)
 
     if external:
         await engine.on_external_cancel(report)
@@ -217,6 +219,151 @@ async def _handle_execution_report(
                 "policy_action": engine.settings.safety.external_intervention_policy,
             },
         ))
+
+
+async def graceful_shutdown(
+    settings: "Settings",
+    engine: GridEngine,
+    ws_api: BinanceWsApi,
+    db_queue: asyncio.Queue,
+    symbol: str,
+) -> None:
+    """4 fázisú shutdown: WS cancel → REST cancel fallback → base sell → DB STOPPED."""
+    log.info("=" * 60)
+    log.info("GRACEFUL SHUTDOWN — kezdés", action=settings.safety.shutdown_action)
+    log.info("=" * 60)
+
+    if settings.safety.shutdown_action == "force_exit":
+        log.warning("force_exit mód — semmi cleanup")
+        if engine.bot_run_id:
+            db_queue.put_nowait(DbEvent(
+                type="update_bot_status",
+                data={"run_id": engine.bot_run_id, "status": "STOPPED"},
+            ))
+        return
+
+    # Bot status STOPPING — ne küldjön új ordert
+    engine.status = "STOPPING"
+
+    # 1. WS cancelAll
+    log.info("Shutdown 1/4: cancelAll WS-en")
+    ws_cancel_ok = False
+    try:
+        ws_api.enqueue_cancel_all(symbol)
+        for i in range(20):  # max 10s
+            await asyncio.sleep(0.5)
+            try:
+                opens = await asyncio.wait_for(
+                    ws_api.get_open_orders(symbol), timeout=2.0
+                )
+                if not opens:
+                    log.info("Shutdown 1/4 OK: minden order WS-en törölve")
+                    ws_cancel_ok = True
+                    break
+            except Exception:
+                continue
+    except Exception as e:
+        log.warning("WS cancelAll hiba", error=str(e))
+
+    # 2. REST fallback cancelAll
+    if not ws_cancel_ok:
+        log.warning("Shutdown 2/4: REST fallback cancelAll")
+        try:
+            from exchange.rest_fallback import BinanceRestFallback
+            rest = BinanceRestFallback(settings.exchange)
+            cancelled = await rest.cancel_all_open_orders(symbol)
+            log.info("REST cancelAll válasz", count=len(cancelled) if isinstance(cancelled, list) else 1)
+            for i in range(10):  # max 5s
+                await asyncio.sleep(0.5)
+                opens = await rest.get_open_orders(symbol)
+                if not opens:
+                    log.info("Shutdown 2/4 OK: minden order REST-en törölve")
+                    ws_cancel_ok = True
+                    break
+        except Exception as e:
+            log.error("REST cancelAll is sikertelen", error=str(e))
+
+    # 3. Base sell MARKET (REST-en, mert biztosabb)
+    if settings.safety.shutdown_action == "cancel_and_sell":
+        log.info("Shutdown 3/4: base sell MARKET (REST)")
+        try:
+            from exchange.rest_fallback import BinanceRestFallback
+            from exchange.precision import round_down_to_step
+            rest = BinanceRestFallback(settings.exchange)
+            account = await rest.get_account()
+            base_asset = settings.bot.base_asset
+            free_base = Decimal("0")
+            for b in account.get("balances", []):
+                if b.get("asset") == base_asset:
+                    free_base = Decimal(b.get("free", "0"))
+                    break
+
+            if free_base <= 0:
+                log.info("Shutdown 3/4: nincs eladandó base", free_base=str(free_base))
+            elif not engine.symbol_info:
+                log.warning("Shutdown 3/4: nincs symbol_info, base sell skip")
+            else:
+                qty = round_down_to_step(free_base, engine.symbol_info.lot_size.step_size)
+                ticker_price = engine.market_stream.mid_price if engine.market_stream else None
+                min_notional = engine.symbol_info.notional.min_notional
+                if not ticker_price:
+                    log.warning("Shutdown 3/4: nincs market price, base sell kihagyva")
+                elif qty * ticker_price < min_notional:
+                    log.info(
+                        "Shutdown 3/4: base mennyiség min_notional alatt",
+                        qty=str(qty), value=str(qty * ticker_price),
+                        min_notional=str(min_notional),
+                    )
+                else:
+                    cid = f"GSHUT-{engine.bot_run_id or 0}-{int(time.time())}"[-36:]
+                    sell_result = await rest.market_sell(symbol, qty, cid)
+                    log.info(
+                        "Shutdown 3/4 OK: base eladva",
+                        qty=str(qty),
+                        status=sell_result.get("status"),
+                        executed=sell_result.get("executedQty"),
+                        quote=sell_result.get("cummulativeQuoteQty"),
+                    )
+                    # Várj amíg a balance ténylegesen eltűnt
+                    for i in range(10):
+                        await asyncio.sleep(1.0)
+                        acc = await rest.get_account()
+                        for b in acc.get("balances", []):
+                            if b.get("asset") == base_asset:
+                                remaining = Decimal(b.get("free", "0"))
+                                if remaining < qty * Decimal("0.01"):
+                                    log.info("Shutdown 3/4: base balance ~0", remaining=str(remaining))
+                                    break
+        except Exception as e:
+            log.error("Shutdown 3/4 base sell hiba", error=str(e))
+    else:
+        log.info("Shutdown 3/4: base sell kihagyva (config: cancel_only)")
+
+    # 4. DB STOPPED
+    log.info("Shutdown 4/4: DB STOPPED + leállás")
+    if engine.bot_run_id:
+        db_queue.put_nowait(DbEvent(
+            type="update_bot_status",
+            data={"run_id": engine.bot_run_id, "status": "STOPPED"},
+        ))
+    await asyncio.sleep(0.5)
+    log.info("=" * 60)
+    log.info("GRACEFUL SHUTDOWN — kész")
+    log.info("=" * 60)
+
+
+async def time_sync_loop(ws_api: BinanceWsApi, interval_sec: int = 300) -> None:
+    """Periodikus Binance szerveridő re-sync (drift védelem)."""
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            result = await ws_api._query("time", {}, authenticated=False)
+            offset = result["serverTime"] - int(time.time() * 1000)
+            from exchange.signing import set_time_offset
+            set_time_offset(offset)
+            log.debug("Time offset re-sync", offset_ms=offset)
+        except Exception as e:
+            log.warning("Time offset re-sync sikertelen", error=str(e))
 
 
 async def command_processor(
@@ -312,7 +459,7 @@ async def _try_recovery(
             return
 
         from sqlalchemy import select, func
-        from persistence.models import Order
+        from persistence.models import Order, Fill
         max_pair_seq = 0
         result = await session.execute(
             select(func.max(Order.pair_id)).where(
@@ -326,6 +473,39 @@ async def _try_recovery(
                 max_pair_seq = int(max_pair_str[2:])
             except ValueError:
                 max_pair_seq = 0
+
+        # MISSED orders visszaolvasás
+        missed_records = (await session.execute(
+            select(Order).where(
+                Order.bot_run_id == run_id,
+                Order.status_local == "MISSED",
+            )
+        )).scalars().all()
+
+        # BUY fill quote-ok pair_id alapján (a MISSED SELL profit-checkhez)
+        buy_fills_by_pair: dict[str, Decimal] = {}
+        if missed_records:
+            # Az érintett pair_id-k alapján a BUY fill quote_quantity-jét keressük
+            # Egy BUY fill pair_id-je az ÁLTALA generált counter SELL pair_id-jével egyezik
+            # (lásd engine._on_order_filled: pair_id ott jön létre).
+            # Tehát: orders.pair_id = X → benne van egy BUY fillje is amit ugyanaz a pair_id azonosít a counter-en.
+            # Egyszerűbb: a fills-ből kivesszük az összes BUY fillt és az order pair_id-jén keresztül linkelünk.
+            buy_orders = (await session.execute(
+                select(Order.client_order_id, Order.pair_id)
+                .where(Order.bot_run_id == run_id, Order.side == "BUY", Order.pair_id.isnot(None))
+            )).all()
+            pair_by_buy_cid = {cid: pid for cid, pid in buy_orders}
+            if pair_by_buy_cid:
+                buy_fills = (await session.execute(
+                    select(Fill.client_order_id, Fill.quote_quantity)
+                    .where(Fill.bot_run_id == run_id, Fill.side == "BUY",
+                           Fill.client_order_id.in_(pair_by_buy_cid.keys()))
+                )).all()
+                # Több fill is lehet egy CID-re — összeadjuk
+                for fcid, qq in buy_fills:
+                    pid = pair_by_buy_cid.get(fcid)
+                    if pid:
+                        buy_fills_by_pair[pid] = buy_fills_by_pair.get(pid, Decimal("0")) + qq
 
     info_data = await ws_api.get_exchange_info(symbol)
     symbols = info_data.get("symbols", [])
@@ -344,6 +524,8 @@ async def _try_recovery(
         open_orders=bot_orders,
         symbol_info=symbol_info,
         max_pair_seq=max_pair_seq,
+        missed_records=missed_records,
+        buy_fills_by_pair=buy_fills_by_pair,
     )
 
     db_queue.put_nowait(DbEvent(
@@ -467,6 +649,7 @@ async def main() -> None:
         tg.create_task(reconciliation.run(), name="reconciliation")
         tg.create_task(watchdog.run(), name="watchdog")
         tg.create_task(profit_reporter.run(), name="profit_reporter")
+        tg.create_task(time_sync_loop(ws_api), name="time_sync")
         tg.create_task(uv_server.serve(), name="internal_http")
 
         log.info("Várakozás WS API és user stream csatlakozásra...")
@@ -529,65 +712,10 @@ async def main() -> None:
         await profit_reporter.stop()
 
         if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
-            try:
-                pre_cancel = await asyncio.wait_for(ws_api.get_open_orders(symbol), timeout=3.0)
-                bot_orders_open = [o for o in pre_cancel if o.get("clientOrderId", "").startswith("G-")]
-                ext_orders_open = [o for o in pre_cancel if not o.get("clientOrderId", "").startswith("G-")]
-                log.info("Leállítás: nyitott orderek törlése",
-                         symbol=symbol,
-                         bot_orders=len(bot_orders_open),
-                         external_orders=len(ext_orders_open),
-                         total=len(pre_cancel))
-                for o in bot_orders_open:
-                    log.debug("Törlendő bot order",
-                              cid=o.get("clientOrderId"), side=o.get("side"),
-                              price=o.get("price"), qty=o.get("origQty"))
-            except Exception:
-                log.info("Nyitott orderek törlése leállítás előtt", symbol=symbol)
-
-            ws_api.enqueue_cancel_all(symbol)
+            await graceful_shutdown(settings, engine, ws_api, db_queue, symbol)
             engine.status = "STOPPED"
-
-            for _ in range(10):
-                await asyncio.sleep(0.5)
-                try:
-                    open_orders = await asyncio.wait_for(
-                        ws_api.get_open_orders(symbol), timeout=3.0
-                    )
-                    if not open_orders:
-                        log.info("Minden order törölve")
-                        break
-                    log.info("Várakozás order törlésre", remaining=len(open_orders))
-                except Exception:
-                    break
-            else:
-                log.warning("Nem sikerült az összes ordert törölni leállítás előtt")
-
-            if settings.safety.sell_on_emergency_stop and engine.symbol_info:
-                try:
-                    account = await ws_api.get_account()
-                    base_asset = settings.bot.base_asset
-                    for b in account.get("balances", []):
-                        if b["a"] == base_asset:
-                            free = Decimal(b["f"])
-                            if free > Decimal("0"):
-                                from exchange.precision import round_down_to_step
-                                qty = round_down_to_step(free, engine.symbol_info.lot_size.step_size)
-                                if qty > 0:
-                                    cid = f"GSELL-{engine.bot_run_id or 0}"
-                                    ws_api.enqueue_market_sell(symbol, qty, cid)
-                                    log.info("Graceful shutdown base sell", asset=base_asset, qty=str(qty))
-                                    await asyncio.sleep(2.0)
-                            break
-                except Exception as e:
-                    log.error("Graceful shutdown base sell hiba", error=str(e))
-
-        if engine.bot_run_id:
-            db_queue.put_nowait(DbEvent(
-                type="update_bot_status",
-                data={"run_id": engine.bot_run_id, "status": "STOPPED"},
-            ))
-            await asyncio.sleep(0.5)
+        else:
+            log.info("Emergency állapot — graceful shutdown skip")
 
         await user_stream.stop()
         await market_stream.stop()

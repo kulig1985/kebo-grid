@@ -9,6 +9,7 @@ Felelős:
 """
 import asyncio
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -18,6 +19,7 @@ from app.log_setup import get_logger
 from exchange.market_stream import MarketStream
 from exchange.models import ExecutionReport, SymbolInfo
 from exchange.precision import round_down_to_step, round_price_to_tick
+from exchange.signing import make_timestamp
 from exchange.ws_api import BinanceWsApi
 from grid.calculator import GridCalculator, GridLevel, GridPlan
 from grid.inventory import InventoryManager
@@ -33,6 +35,19 @@ def _ms_to_timestr(ms: int) -> str:
     """Binance epoch ms → 'HH:MM:SS.mmm' (UTC)."""
     dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
     return dt.strftime("%H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+@dataclass
+class MissedLevel:
+    """Post-only reject vagy EXPIRED után — várja a maker-szafe ár visszatérését."""
+    level_index: int
+    side: str                              # BUY | SELL
+    target_price: Decimal
+    target_qty: Decimal
+    original_pair_id: Optional[str]
+    buy_fill_quote: Optional[Decimal]      # csak SELL counter — profit check
+    retry_count: int
+    last_attempt_ms: int
 
 
 class BotStatus(str):
@@ -85,6 +100,12 @@ class GridEngine:
         self._level_orders: dict[int, str] = {}  # level_index -> client_order_id
         self._order_levels: dict[str, int] = {}  # client_order_id -> level_index
         self._order_sides: dict[str, str] = {}   # client_order_id -> BUY|SELL
+        self._order_pairs: dict[str, Optional[str]] = {}   # client_order_id -> pair_id
+
+        # MISSED state (post-only reject vagy EXPIRED — várja maker-szafe ár visszatérését)
+        self._missed_levels: dict[int, "MissedLevel"] = {}
+        # pair_id -> BUY fill quote — counter SELL profit-checkhez
+        self._buy_fill_quote_by_pair: dict[str, Decimal] = {}
 
         self._cycle_seq = 0
         self._order_seq = 0
@@ -233,22 +254,35 @@ class GridEngine:
         revenue_per_cycle = bot.order_quote_value * (1 + step) * (1 - fs)
         profit_per_cycle = revenue_per_cycle - cost_per_cycle
 
+        # Grid táblázat — minden szint felsorolva (felülről lefelé)
+        rows = []
+        for lv in sorted(self.grid_plan.sell_levels, key=lambda x: -x.index):
+            rows.append((lv.index, "SELL", lv.price, lv.quantity, lv.notional))
+        rows.append((0, "ANCHOR", anchor_price, Decimal("0"), Decimal("0")))
+        for lv in sorted(self.grid_plan.buy_levels, key=lambda x: -x.index):
+            rows.append((lv.index, "BUY", lv.price, lv.quantity, lv.notional))
+
         log.info(
-            "Grid generálva",
+            "GRID_TABLE",
+            symbol=bot.symbol,
             type=bot.grid_type,
-            k_buy=self.grid_plan.k_buy,
-            k_sell=self.grid_plan.k_sell,
-            order_quote_value=str(bot.order_quote_value),
-            quote_needed=str(self.grid_plan.total_quote_required),
-            base_needed=str(self.grid_plan.total_base_required),
+            anchor=str(anchor_price),
             step_pct=f"{step*100:.3f}%",
             break_even_pct=f"{break_even_step*100:.3f}%",
-            profit_per_cycle=f"{profit_per_cycle:.4f} {bot.quote_asset}",
             grid_low=str(self.grid_plan.grid_low_price),
             grid_high=str(self.grid_plan.grid_high_price),
             grid_range_pct=f"{((self.grid_plan.grid_high_price / self.grid_plan.grid_low_price - 1) * 100):.1f}%"
             if self.grid_plan.grid_low_price and self.grid_plan.grid_high_price
             else "N/A",
+            k_buy=self.grid_plan.k_buy,
+            k_sell=self.grid_plan.k_sell,
+            order_quote_value=f"{bot.order_quote_value} {bot.quote_asset}",
+            profit_per_cycle=f"{profit_per_cycle:.4f} {bot.quote_asset}",
+            quote_needed=f"{self.grid_plan.total_quote_required:.2f} {bot.quote_asset}",
+            base_needed=f"{self.grid_plan.total_base_required.normalize()} {bot.base_asset}",
+            rows=rows,
+            base_asset=bot.base_asset,
+            quote_asset=bot.quote_asset,
         )
 
         # Grid map építés – O(1) counter order lookup
@@ -290,6 +324,11 @@ class GridEngine:
 
         # 5. Kezdeti order-ek elküldése (non-blocking)
         self.status = BotStatus.RUNNING
+
+        # MISSED recovery callback regisztrálás a market stream-en
+        if self.market_stream is not None:
+            self.market_stream.register_tick_callback(self._on_market_tick)
+
         await self._place_initial_orders()
 
     async def _determine_anchor_price(self) -> Decimal:
@@ -329,27 +368,53 @@ class GridEngine:
         assert self.router is not None
 
         # Buy order-ek
+        buy_placed = 0
         for level in self.grid_plan.buy_levels:
             if not self.inventory.has_quote_for_buy(level.notional):
                 log.warning("Nincs elég quote a buy order-hez", lvl=level.index, price=str(level.price))
                 continue
-            self._submit_level_order(level, cycle_id=0)
+            cid = self._submit_level_order(level, cycle_id=0)
+            log.info(
+                "INIT_ORDER", side="BUY", lvl=level.index,
+                price=level.price.normalize(), qty=level.quantity.normalize(),
+                notional=f"{level.notional:.2f}",
+                quote_asset=bot.quote_asset, cid=cid,
+            )
+            buy_placed += 1
 
         # Sell order-ek (csak ha van base inventory)
+        sell_placed = 0
         if bot.inventory_mode in ("prebalanced", "use_existing_balances"):
             for level in self.grid_plan.sell_levels:
                 if not self.inventory.has_base_for_sell(level.quantity):
                     log.warning("Nincs elég base a sell order-hez", lvl=level.index)
                     break
-                self._submit_level_order(level, cycle_id=0)
+                cid = self._submit_level_order(level, cycle_id=0)
+                log.info(
+                    "INIT_ORDER", side="SELL", lvl=level.index,
+                    price=level.price.normalize(), qty=level.quantity.normalize(),
+                    notional=f"{level.notional:.2f}",
+                    quote_asset=bot.quote_asset, cid=cid,
+                )
+                sell_placed += 1
         elif bot.inventory_mode == "quote_only_bootstrap":
             await self._execute_bootstrap()
 
-        log.info("Kezdeti order-ek bekülve (non-blocking)")
+        log.info("Kezdeti order-ek bekülve", buy=buy_placed, sell=sell_placed)
 
     def _submit_level_order(self, level: GridLevel, cycle_id: int, pair_id: Optional[str] = None) -> str:
-        """Egy grid szint order-ét beküldi a routerbe."""
+        """Egy grid szint order-ét beküldi a routerbe. Anti-double védett."""
         assert self.router is not None
+
+        # Anti-double: ha már van élő order ezen a szinten, skip
+        existing_cid = self._level_orders.get(level.index)
+        if existing_cid:
+            log.warning(
+                "Skip duplicate submit",
+                lvl=level.index, side=level.side, existing_cid=existing_cid,
+            )
+            return existing_cid
+
         self._order_seq += 1
         cid = make_client_order_id(
             self._bot_run_short_id,
@@ -376,6 +441,7 @@ class GridEngine:
         self._level_orders[level.index] = cid
         self._order_levels[cid] = level.index
         self._order_sides[cid] = level.side
+        self._order_pairs[cid] = pair_id
         return cid
 
     async def on_execution_report(self, report: ExecutionReport) -> None:
@@ -400,6 +466,151 @@ class GridEngine:
 
         if report.execution_type == "TRADE" and report.order_status == "FILLED":
             await self._on_order_filled(report)
+
+    async def on_order_rejected(self, report: ExecutionReport) -> None:
+        """REJECTED/EXPIRED feldolgozás: post-only → MISSED, egyéb → log + cleanup."""
+        if self.status == BotStatus.EMERGENCY_STOPPING:
+            return
+        cid = report.client_order_id
+        if not cid.startswith("G-"):
+            return
+
+        # Bootstrap reject külön branch
+        if self._bootstrap_cid and cid == self._bootstrap_cid:
+            await self._on_bootstrap_rejected(report)
+            return
+
+        level_index = self._order_levels.get(cid)
+        side = self._order_sides.get(cid)
+        if level_index is None or side is None:
+            log.warning("Reject ismeretlen CID-re", cid=cid)
+            return
+
+        grid_line = self.grid_map.get(level_index)
+        if grid_line is None:
+            log.error("Reject ismeretlen szinten", cid=cid, lvl=level_index)
+            self._level_orders.pop(level_index, None)
+            return
+
+        reason = (report.reject_reason or "").upper()
+        is_post_only = (
+            "IMMEDIATELY_MATCH" in reason
+            or "POST_ONLY" in reason
+            or "WOULD_TAKE" in reason
+            or report.execution_type == "EXPIRED"
+            or report.order_status == "EXPIRED"
+        )
+
+        # Cleanup mindenképp
+        self._level_orders.pop(level_index, None)
+
+        # DB: Order.status_local frissítés
+        new_state = "MISSED" if is_post_only else "REJECTED"
+        self.db_queue.put_nowait(DbEvent(
+            type="update_order_local_state",
+            data={
+                "client_order_id": cid,
+                "state": new_state,
+                "reject_reason": reason or report.execution_type,
+            },
+        ))
+
+        if is_post_only:
+            pair_id = self._order_pairs.get(cid)
+            buy_quote = self._buy_fill_quote_by_pair.get(pair_id) if pair_id else None
+            self._missed_levels[level_index] = MissedLevel(
+                level_index=level_index, side=side,
+                target_price=grid_line.price,
+                target_qty=grid_line.quantity if grid_line.quantity > 0 else Decimal("0"),
+                original_pair_id=pair_id, buy_fill_quote=buy_quote,
+                retry_count=0, last_attempt_ms=make_timestamp(),
+            )
+            log.info("MISSED", side=side, lvl=level_index,
+                     price=str(grid_line.price), reason=reason or report.execution_type)
+        else:
+            log.error("Order REJECTED nem-post-only",
+                      cid=cid, side=side, lvl=level_index, reason=reason)
+
+    def _on_market_tick(self, mid_price: Decimal) -> None:
+        """Market stream callback: missed cellák próbálkozása ha az ár újra maker-szafe."""
+        if not self._missed_levels or self.status != BotStatus.RUNNING:
+            return
+        try:
+            self._try_recover_missed(mid_price)
+        except Exception as e:
+            log.warning("MISSED recovery loop hiba", error=str(e))
+
+    def _try_recover_missed(self, mid_price: Decimal) -> None:
+        """Mid_price tick: ha egy MISSED cella maker-szafe lett, újra submit."""
+        fees = self.settings.fees
+        fs = fees.effective_sell_fee
+        debounce_ms = 500
+        now_ms = make_timestamp()
+
+        for level_index, missed in list(self._missed_levels.items()):
+            if now_ms - missed.last_attempt_ms < debounce_ms:
+                continue
+
+            if missed.side == "BUY":
+                # BUY @ P maker-szafe ha mid > P (ár felette van)
+                if mid_price <= missed.target_price:
+                    continue
+            else:  # SELL
+                # SELL @ P maker-szafe ha mid < P (ár alatta van)
+                if mid_price >= missed.target_price:
+                    continue
+                # Profit-check (pair_id alapján): a SELL ezen az áron + fee után
+                # ne adjon kevesebb quote-ot mint az eredeti BUY-ra elköltött
+                if missed.buy_fill_quote and missed.buy_fill_quote > 0 and missed.target_qty > 0:
+                    expected = missed.target_qty * missed.target_price * (Decimal("1") - fs)
+                    if expected <= missed.buy_fill_quote:
+                        continue  # várj amíg magasabb az ár
+
+            grid_level = self.grid_map.get(level_index)
+            if grid_level is None:
+                self._missed_levels.pop(level_index, None)
+                continue
+
+            log.info(
+                "MISSED_RETRY", side=missed.side, lvl=level_index,
+                price=str(missed.target_price),
+                retry=missed.retry_count + 1, mid=str(mid_price),
+            )
+            missed.retry_count += 1
+            missed.last_attempt_ms = now_ms
+            # Kivesszük a missed-ből; ha újra reject jön, on_order_rejected visszateszi
+            self._missed_levels.pop(level_index, None)
+            self._submit_level_order(
+                grid_level,
+                cycle_id=self._cycle_seq,
+                pair_id=missed.original_pair_id,
+            )
+
+    async def _on_bootstrap_rejected(self, report: ExecutionReport) -> None:
+        """Bootstrap LIMIT_MAKER reject → MARKET fallback. MARKET reject → emergency."""
+        log.error("Bootstrap REJECTED",
+                  cid=report.client_order_id, reason=report.reject_reason,
+                  execution_type=report.execution_type)
+        if self.settings.bootstrap.order_type != "MARKET":
+            log.warning(
+                "Bootstrap fallback MARKET-re",
+                original_type=self.settings.bootstrap.order_type,
+            )
+            self._bootstrap_cid = None
+            self._bootstrap_pending = False
+            original = self.settings.bootstrap.order_type
+            self.settings.bootstrap.order_type = "MARKET"
+            try:
+                await self._execute_bootstrap()
+            finally:
+                self.settings.bootstrap.order_type = original
+        else:
+            from supervisor.emergency import EmergencyStop
+            # Az emergency referenciát nem itt birtokoljuk — de a watchdog majd észleli
+            log.critical(
+                "Bootstrap MARKET REJECTED — bot leblokkol, kézi beavatkozás kell!",
+                reason=report.reject_reason,
+            )
 
     async def _on_order_filled(self, report: ExecutionReport) -> None:
         """
@@ -433,6 +644,14 @@ class GridEngine:
                  filled_at=_ms_to_timestr(report.transaction_time),
                  pair=pair_id)
 
+        # FILLED cleanup: a fillelő ordert kivesszük a _level_orders-ből,
+        # különben a következő counter SELL/BUY ezen a szinten anti-double-skip-pel ütközne.
+        self._level_orders.pop(level_index, None)
+
+        # BUY fill esetén mentjük a quote-ot a counter SELL profit-checkhez (pair_id alapján)
+        if side == "BUY":
+            self._buy_fill_quote_by_pair[pair_id] = report.cumulative_quote_qty
+
         if side == "BUY":
             counter_index = level_index + 1
             counter_side = "SELL"
@@ -465,7 +684,7 @@ class GridEngine:
         )
         self._submit_level_order(counter_level, cycle_id=self._cycle_seq, pair_id=pair_id)
 
-        sent_ms = int(time.time() * 1000)
+        sent_ms = make_timestamp()
         log.info("COUNTER", side=counter_side, lvl=counter_index,
                  price=counter_price.normalize(), qty=qty.normalize(),
                  value=f"{qty * counter_price:.2f}",
@@ -596,12 +815,19 @@ class GridEngine:
 
         placed = 0
         remaining = acquired
+        bot = self.settings.bot
         for level in self.grid_plan.sell_levels:
             if remaining < level.quantity:
                 log.info("Bootstrap: nincs elég base a további sell szintekhez",
                          remaining=str(remaining), needed=str(level.quantity))
                 break
-            self._submit_level_order(level, cycle_id=0)
+            cid = self._submit_level_order(level, cycle_id=0)
+            log.info(
+                "INIT_ORDER", side="SELL", lvl=level.index,
+                price=level.price.normalize(), qty=level.quantity.normalize(),
+                notional=f"{level.notional:.2f}",
+                quote_asset=bot.quote_asset, cid=cid,
+            )
             remaining -= level.quantity
             placed += 1
 
@@ -616,6 +842,8 @@ class GridEngine:
         open_orders: list[dict],
         symbol_info: SymbolInfo,
         max_pair_seq: int = 0,
+        missed_records: Optional[list] = None,
+        buy_fills_by_pair: Optional[dict] = None,
     ) -> None:
         """
         Recovery: bent ragadt orderekből újraépíti a grid állapotot.
@@ -723,6 +951,29 @@ class GridEngine:
             pair_seq=self._pair_seq,
         )
 
+        # MISSED state visszaállítása DB-ből
+        if missed_records:
+            buy_fills_map = buy_fills_by_pair or {}
+            now_ms = make_timestamp()
+            for o in missed_records:
+                lvl_idx = o.grid_level_index
+                if lvl_idx is None:
+                    continue
+                grid_line = self.grid_map.get(lvl_idx)
+                target_price = grid_line.price if grid_line else o.price
+                target_qty = grid_line.quantity if (grid_line and grid_line.quantity > 0) else o.original_quantity
+                self._missed_levels[lvl_idx] = MissedLevel(
+                    level_index=lvl_idx,
+                    side=o.side,
+                    target_price=target_price,
+                    target_qty=target_qty,
+                    original_pair_id=o.pair_id,
+                    buy_fill_quote=buy_fills_map.get(o.pair_id),
+                    retry_count=0,
+                    last_attempt_ms=now_ms,
+                )
+            log.info("MISSED visszaállítva DB-ből", count=len(self._missed_levels))
+
         # Account frissítés
         account_data = await self.ws_api.get_account()
         self.inventory.update_from_account(account_data.get("balances", []))
@@ -730,10 +981,16 @@ class GridEngine:
         relevant = {a: v for a, v in self.inventory.snapshot().items() if a in bot_assets}
 
         self.status = BotStatus.RUNNING
+
+        # MISSED recovery callback regisztrálás a market stream-en
+        if self.market_stream is not None:
+            self.market_stream.register_tick_callback(self._on_market_tick)
+
         log.info("Recovery kész",
                  bot_run_id=bot_run_id,
                  open_orders=len(self._level_orders),
                  grid_levels=len(self.grid_map),
+                 missed_levels=len(self._missed_levels),
                  balances=relevant,
                  bootstrap_pending=self._bootstrap_pending)
 

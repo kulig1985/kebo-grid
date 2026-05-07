@@ -64,9 +64,10 @@ class ProfitReporter:
             current_price = self.engine.market_stream.mid_price
 
         bot = self.engine.settings.bot
-        snapshot = self.engine.inventory.snapshot()
-        wallet_base = snapshot.get(bot.base_asset, Decimal("0"))
-        wallet_quote = snapshot.get(bot.quote_asset, Decimal("0"))
+        inv = self.engine.inventory
+        # Teljes egyenleg = free + locked (a nyitott orderekben lockolt is a tőkéhez tartozik)
+        wallet_base = inv.free(bot.base_asset) + inv.locked(bot.base_asset)
+        wallet_quote = inv.free(bot.quote_asset) + inv.locked(bot.quote_asset)
         initial_capital = bot.total_capital_quote
 
         report = compute_half_match_profit(

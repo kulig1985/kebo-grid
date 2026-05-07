@@ -44,6 +44,8 @@ class Watchdog:
         self._running = False
         self._rejection_count = 0
         self._ws_stale_warned = False
+        self._stale_force_close_count = 0
+        self._last_force_close_ts: float = 0.0
 
     async def run(self) -> None:
         self._running = True
@@ -69,14 +71,37 @@ class Watchdog:
                 )
                 return
 
-        # Trading WS staleness — egyszer figyelmeztet, nem spammel
+        # Trading WS: 5 perc stale (is_connected==True, de a Binance "fél-élő") → force reconnect.
+        # Ha 3-szor egymás után kell, az emergency stop.
         ws_age = self.ws_api.last_msg_age_sec
-        if ws_age > self.config.max_trading_ws_staleness_sec and self.ws_api.is_connected:
+        idle_limit = getattr(self.config, "max_trading_ws_idle_force_close_sec", 300)
+
+        if not self.ws_api.is_connected:
             if not self._ws_stale_warned:
-                log.warning("Trading WS régi utolsó üzenet", age_sec=f"{ws_age:.0f}s")
+                log.warning("Trading WS disconnected — auto-reconnect várás")
                 self._ws_stale_warned = True
+        elif ws_age > idle_limit:
+            now = time.monotonic()
+            # Debounce: a force close után adjunk legalább 30s-et a reconnect-re mielőtt újraértékelünk
+            if now - self._last_force_close_ts < 30:
+                return
+            self._stale_force_close_count += 1
+            self._last_force_close_ts = now
+            log.warning(
+                "Trading WS stale — force reconnect",
+                age_sec=f"{ws_age:.0f}s",
+                attempt=self._stale_force_close_count,
+            )
+            await self.ws_api.force_reconnect("watchdog_stale")
+            if self._stale_force_close_count >= 3:
+                await self.emergency.execute(
+                    f"Trading WS 3x stale ({idle_limit}s) — emergency stop"
+                )
+                return
         else:
+            # Élő és friss → reset
             self._ws_stale_warned = False
+            self._stale_force_close_count = 0
 
         # DB writer queue telítettség
         if self.config.emergency_stop_on_db_queue_full:

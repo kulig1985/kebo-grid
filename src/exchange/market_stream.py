@@ -10,7 +10,7 @@ import asyncio
 import json
 import time
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 import websockets
 
@@ -35,6 +35,11 @@ class MarketStream:
         self._last_trade_price: Optional[Decimal] = None
         self._running = False
         self._last_update_time: float = 0.0
+        self._tick_callbacks: list[Callable[[Decimal], None]] = []
+
+    def register_tick_callback(self, cb: Callable[[Decimal], None]) -> None:
+        """Minden bookTicker frissítésnél meghívandó callback (mid_price-szal)."""
+        self._tick_callbacks.append(cb)
 
     async def start(self) -> None:
         self._running = True
@@ -55,6 +60,12 @@ class MarketStream:
                                 bid_price=Decimal(data["b"]),
                                 ask_price=Decimal(data["a"]),
                             )
+                            mid = self._latest_ticker.mid_price
+                            for cb in self._tick_callbacks:
+                                try:
+                                    cb(mid)
+                                except Exception as cb_err:
+                                    log.warning("Market tick callback hiba", error=str(cb_err))
                         except Exception as e:
                             log.debug("Market stream parse hiba", error=str(e))
             except Exception as e:

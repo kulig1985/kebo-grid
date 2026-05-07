@@ -92,6 +92,18 @@ class BinanceWsApi:
             finally:
                 self._connected.clear()
                 self._ws = None
+                # Pending query future-öket lezárjuk, különben örökké várnak
+                if self._pending:
+                    log.warning(
+                        "Pending WS query-k lezárása reconnect előtt",
+                        count=len(self._pending),
+                    )
+                    for req_id, fut in list(self._pending.items()):
+                        if not fut.done():
+                            fut.set_exception(
+                                ConnectionError("WS disconnected — pending request canceled")
+                            )
+                    self._pending.clear()
 
             if not self._running:
                 break
@@ -137,10 +149,14 @@ class BinanceWsApi:
             # 23 óra után proaktív újracsatlakozás
             if time.monotonic() - self._connect_time > RECONNECT_BEFORE_HOURS * 3600:
                 log.info("WS API proaktív újracsatlakozás (24h limit)")
-                break
+                return
 
             try:
                 cmd = await asyncio.wait_for(self.send_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            try:
                 params = self._prepare_params(cmd)
                 message = json.dumps({
                     "id": cmd.request_id,
@@ -150,8 +166,22 @@ class BinanceWsApi:
                 await self._ws.send(message)
                 self.send_queue.task_done()
                 log.debug("WS API kérelem küldve", method=cmd.method, id=cmd.request_id)
-            except asyncio.TimeoutError:
-                continue
+            except (ConnectionClosed, OSError) as e:
+                log.warning(
+                    "WS send hiba — üzenet visszatéve, reconnect",
+                    method=cmd.method, error=str(e),
+                )
+                self.send_queue.task_done()
+                # Visszatesszük az üzenetet (a reconnect után újra próbáljuk)
+                self.send_queue.put_nowait(cmd)
+                return  # writer_loop reconnect-el
+            except Exception as e:
+                log.error(
+                    "WS send egyéb hiba — üzenet eldobva",
+                    method=cmd.method, error=str(e),
+                )
+                self.send_queue.task_done()
+                return
 
     def _prepare_params(self, cmd: WsSendCommand) -> dict:
         """Ha hiteles kérelem, timestamp és signature hozzáadása."""
@@ -383,6 +413,15 @@ class BinanceWsApi:
         self._running = False
         if self._ws:
             await self._ws.close()
+
+    async def force_reconnect(self, reason: str) -> None:
+        """Watchdog által triggerelt force WS close — a writer_loop reconnect-el."""
+        log.warning("WS API force reconnect", reason=reason)
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception as e:
+                log.debug("WS force_reconnect close hiba (várt)", error=str(e))
 
     @property
     def last_msg_age_sec(self) -> float:
