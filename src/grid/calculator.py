@@ -120,10 +120,17 @@ class GridCalculator:
         buy_side_override: Optional[int] = None,
         sell_side_override: Optional[int] = None,
     ) -> tuple[int, int]:
-        """Meghatározza a buy és sell szintek számát tőke alapján."""
+        """
+        Meghatározza a buy és sell szintek számát tőke alapján — SZIMMETRIKUS grid.
+        Mindkét oldalon V quote-érték / szint, tehát K_total = available / (2V).
+        """
         available = total_capital_quote * (1 - quote_reserve_pct)
-        k_total = int(available // order_quote_value)
-        k_total = min(k_total, max_grid_levels)
+
+        # SZIMMETRIKUS GRID: k_buy = k_sell = K
+        # Mindkét oldal V értékű (ugyanannyi quote-érték), tehát egy szint-pár költsége = 2V.
+        # A bootstrap MARKET buy-ban a buffer+fee miatt picit többet költünk,
+        # ezt a quote_reserve_pct fedezi (vagy a pre-flight check elkapja).
+        cost_per_pair = order_quote_value * Decimal("2")
 
         if buy_side_override is not None and sell_side_override is not None:
             k_buy = buy_side_override
@@ -131,15 +138,22 @@ class GridCalculator:
             required = (k_buy + k_sell) * order_quote_value
             if required > available:
                 raise ValueError(
-                    f"K_buy={k_buy} + K_sell={k_sell} szint ({required} USDT) "
-                    f"meghaladja az elérhető tőkét ({available} USDT)."
+                    f"K_buy={k_buy} + K_sell={k_sell} szint ({required:.2f} USDC) "
+                    f"meghaladja az elérhető tőkét ({available:.2f})."
                 )
         else:
-            k_buy = int(k_total * buy_allocation_ratio)
-            k_sell = k_total - k_buy
+            # Szimmetrikus K
+            max_pairs = int(available // cost_per_pair)
+            max_pairs = min(max_pairs, max_grid_levels // 2)
+            k_buy = max_pairs
+            k_sell = max_pairs
 
         if k_buy == 0 and k_sell == 0:
-            raise ValueError("Nincs elég tőke egyetlen grid szinthez sem.")
+            raise ValueError(
+                f"Nincs elég tőke egyetlen grid szint-párhoz sem. "
+                f"available={available:.2f}, cost_per_pair={cost_per_pair:.2f} "
+                f"(2 × V={order_quote_value})"
+            )
 
         return k_buy, k_sell
 
