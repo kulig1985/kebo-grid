@@ -322,7 +322,11 @@ class GridEngine:
             data={"bot_run_id": bot_run_id, "levels": levels_to_save},
         ))
 
-        # 5. Kezdeti order-ek elküldése (non-blocking)
+        # 5. Pre-flight balance check (CRITICAL: ne küldjünk ordert ha nem fér el!)
+        if bot.inventory_mode == "quote_only_bootstrap":
+            self._preflight_balance_check()
+
+        # 6. Kezdeti order-ek elküldése (non-blocking)
         self.status = BotStatus.RUNNING
 
         # MISSED recovery callback regisztrálás a market stream-en
@@ -330,6 +334,56 @@ class GridEngine:
             self.market_stream.register_tick_callback(self._on_market_tick)
 
         await self._place_initial_orders()
+
+    def _preflight_balance_check(self) -> None:
+        """
+        Indulás előtti tőke ellenőrzés quote_only_bootstrap módban.
+        Hibát dob, ha a buy orderek + bootstrap nem fér el az elérhető quote-ba.
+        Ha bukik: SEMMI nem megy ki az exchange-re, a bot gracefully leáll.
+        """
+        assert self.grid_plan is not None
+        bot = self.settings.bot
+        bootstrap_cfg = self.settings.bootstrap
+        fb = self.settings.fees.effective_buy_fee
+        buffer = bootstrap_cfg.base_buffer_pct
+
+        # Bootstrap quote igénye: vagy explicit megadva, vagy ugyanaz a képlet mint az _execute_bootstrap-ben
+        bootstrap_qty = bootstrap_cfg.quote_qty
+        if bootstrap_qty is None:
+            required_base = sum(
+                (lv.quantity for lv in self.grid_plan.sell_levels),
+                Decimal("0"),
+            )
+            gross_base = required_base * (Decimal("1") + buffer) / (Decimal("1") - fb)
+            bootstrap_qty = (gross_base * self.grid_plan.anchor_price).quantize(Decimal("0.01"))
+
+        # Buy orderek lockolt tőkéje
+        buy_lock = sum(
+            (lv.notional for lv in self.grid_plan.buy_levels),
+            Decimal("0"),
+        )
+        total_needed = buy_lock + bootstrap_qty
+        free_quote = self.inventory.free(bot.quote_asset)
+
+        if total_needed > free_quote:
+            raise ValueError(
+                f"Nincs elég {bot.quote_asset} a grid + bootstrap induláshoz!\n"
+                f"  szükséges: {total_needed:.2f} {bot.quote_asset}\n"
+                f"    - {self.grid_plan.k_buy} BUY order: {buy_lock:.2f}\n"
+                f"    - bootstrap (base vétel): {bootstrap_qty:.2f}\n"
+                f"  rendelkezésre áll: {free_quote:.2f} {bot.quote_asset}\n"
+                f"  hiány: {total_needed - free_quote:.2f} {bot.quote_asset}\n"
+                f"  Megoldás: növeld total_capital_quote-t legalább {total_needed:.2f}-re, "
+                f"vagy csökkentsd max_grid_levels-t."
+            )
+
+        log.info(
+            "Pre-flight balance OK",
+            free=f"{free_quote:.2f}",
+            needed=f"{total_needed:.2f}",
+            buy_lock=f"{buy_lock:.2f}",
+            bootstrap=f"{bootstrap_qty:.2f}",
+        )
 
     async def _determine_anchor_price(self) -> Decimal:
         """
