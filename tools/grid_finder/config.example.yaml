@@ -1,0 +1,25 @@
+# Grid Pair Finder — config minta
+# Másold át config.yaml-ba (gitignore alatt) és állítsd be a saját értékeidet.
+
+# === Adatforrás ===
+quote_asset: USDC
+lookback_days: 30                    # mennyi nap visszamenőleg (max ~1000)
+exclude_symbols: []                  # pl. [BTCUSDC, ETHUSDC] — ha valamit ki akarsz hagyni
+
+# === Likviditás előszűrés ===
+min_volume_24h_quote: 50000          # USDC napi forgalom minimum
+
+# === Bot paraméterek (a sensitivity szimulációhoz, ugyanaz mint a tiausdc.yaml-ban) ===
+bot:
+  capital_quote: 55                  # total tőke USDC-ben
+  quote_reserve_pct: 0.0             # tartalék (0..1)
+  max_grid_levels: 20                # max szint összesen (pár = 2 szint)
+  buy_allocation_ratio: 0.5          # 0.5 = szimmetrikus
+  target_profit_pct: 0.005           # 0.005 = 0.5% nettó cycle profit (a fee FÖLÖTT)
+  fee_buy: 0.00075                   # 0.00075 = BNB-discount; 0.001 = standard
+  fee_sell: 0.00075
+  base_buffer_pct: 0.05              # bootstrap base buffer (5%)
+
+# === Output ===
+top_n: 30                            # ennyit mutat a táblázat tetején
+output_dir: output                   # report ide kerül

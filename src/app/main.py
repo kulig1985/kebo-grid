@@ -138,7 +138,12 @@ async def _handle_execution_report(
         return
 
     has_local_cancel = cid in local_cancels
-    if engine.status in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED") and report.execution_type == "CANCELED":
+    # Shutdown / emergency állapotban a cancelAll összes orderét local cancel-nek vesszük
+    # (a cancelAll nem CID-enként megy, így a local_cancels set-be sem kerül be)
+    if engine.status in (
+        "EMERGENCY_STOPPING", "EMERGENCY_STOPPED",
+        "STOPPING", "STOPPED",
+    ) and report.execution_type == "CANCELED":
         has_local_cancel = True
 
     current = LocalOrderState.SUBMITTED_UNKNOWN
@@ -198,6 +203,10 @@ async def _handle_execution_report(
                 "raw_event_json": data,
             },
         ))
+
+    # ACK tracking — Binance NEW = az exchange elfogadta az ordert
+    if report.execution_type == "NEW":
+        engine._order_acked_set.add(cid)
 
     if report.order_status == "FILLED":
         await engine.on_execution_report(report)
@@ -638,93 +647,139 @@ async def main() -> None:
     uv_config = uvicorn.Config(internal_app, host="0.0.0.0", port=8080, log_level="warning")
     uv_server = uvicorn.Server(uv_config)
 
-    async with asyncio.TaskGroup() as tg:
-        tg.create_task(ws_api.writer_loop(), name="ws_writer")
-        tg.create_task(ws_api.reader_loop(), name="ws_reader")
-        tg.create_task(user_stream.start(), name="user_stream")
-        tg.create_task(market_stream.start(), name="market_stream")
-        tg.create_task(db_writer.run(), name="db_writer")
-        tg.create_task(event_dispatcher(event_queue, db_queue, engine), name="event_dispatcher")
-        tg.create_task(command_processor(command_queue, engine, emergency), name="cmd_processor")
-        tg.create_task(reconciliation.run(), name="reconciliation")
-        tg.create_task(watchdog.run(), name="watchdog")
-        tg.create_task(profit_reporter.run(), name="profit_reporter")
-        tg.create_task(time_sync_loop(ws_api), name="time_sync")
-        tg.create_task(uv_server.serve(), name="internal_http")
+    symbol = settings.bot.symbol
+    crash_error: Optional[BaseException] = None
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(ws_api.writer_loop(), name="ws_writer")
+            tg.create_task(ws_api.reader_loop(), name="ws_reader")
+            tg.create_task(user_stream.start(), name="user_stream")
+            tg.create_task(market_stream.start(), name="market_stream")
+            tg.create_task(db_writer.run(), name="db_writer")
+            tg.create_task(event_dispatcher(event_queue, db_queue, engine), name="event_dispatcher")
+            tg.create_task(command_processor(command_queue, engine, emergency), name="cmd_processor")
+            tg.create_task(reconciliation.run(), name="reconciliation")
+            tg.create_task(watchdog.run(), name="watchdog")
+            tg.create_task(profit_reporter.run(), name="profit_reporter")
+            tg.create_task(time_sync_loop(ws_api), name="time_sync")
+            tg.create_task(uv_server.serve(), name="internal_http")
 
-        log.info("Várakozás WS API és user stream csatlakozásra...")
+            log.info("Várakozás WS API és user stream csatlakozásra...")
+            try:
+                await asyncio.wait_for(ws_api._connected.wait(), timeout=30.0)
+                log.info("WS API csatlakozva, várakozás user stream-re...")
+                await asyncio.wait_for(user_stream.connected.wait(), timeout=30.0)
+                log.info("User stream csatlakozva")
+            except asyncio.TimeoutError:
+                raise RuntimeError("WS API vagy user stream nem csatlakozott 30s alatt!")
+
+            try:
+                result = await ws_api._query("time", {}, authenticated=False)
+                server_ms = result["serverTime"]
+                local_ms = int(time.time() * 1000)
+                offset = server_ms - local_ms
+                from exchange.signing import set_time_offset
+                set_time_offset(offset)
+                if abs(offset) > 1000:
+                    log.warning("Rendszeróra eltérés korrigálva", offset_ms=offset)
+                else:
+                    log.info("Szerver idő szinkronizálva", offset_ms=offset)
+            except Exception as e:
+                log.warning("Szerver idő szinkron sikertelen, folytatás", error=str(e))
+
+            log.info("Open orders lekérdezés...", symbol=symbol)
+            existing_orders = await ws_api.get_open_orders(symbol)
+            bot_orders = [o for o in existing_orders if o.get("clientOrderId", "").startswith("G-")]
+
+            if bot_orders:
+                await _try_recovery(engine, ws_api, settings, bot_orders, db_queue)
+
+            if engine.status == "INITIALIZING":
+                from persistence.db import get_session
+                async with get_session() as session:
+                    repo = BotRunRepo(session)
+                    run = await repo.create({
+                        "symbol": settings.bot.symbol,
+                        "base_asset": settings.bot.base_asset,
+                        "quote_asset": settings.bot.quote_asset,
+                        "status": "INITIALIZING",
+                        "config_json": settings.bot.model_dump(mode="json"),
+                        "grid_type": settings.bot.grid_type,
+                        "total_capital_quote": settings.bot.total_capital_quote,
+                        "order_quote_value": settings.bot.order_quote_value,
+                        "target_net_profit_quote": settings.bot.target_net_profit_per_cycle_quote
+                        or settings.bot.target_profit_pct,
+                    })
+                    run_id = run.id
+                short_id = make_run_short_id(run_id)
+                log.info("Friss indítás: bot run létrehozva", run_id=run_id, short_id=short_id)
+                tg.create_task(engine.initialize(run_id, short_id), name="engine_init")
+
+            await _shutdown.wait()
+            log.info("Leállítás (normál) — shutdown signal vagy stop command")
+            _shutdown.set()  # biztonság ha command_processor szignált, ne lógjon
+    except* Exception as eg:
+        crash_error = eg
+        errs = [type(e).__name__ + ": " + str(e)[:200] for e in eg.exceptions]
+        log.error("TaskGroup crash — graceful shutdown indítása", errors=errs)
+        _shutdown.set()
+    finally:
+        # MINDIG fut, akár normál akár crash
         try:
-            await asyncio.wait_for(ws_api._connected.wait(), timeout=30.0)
-            log.info("WS API csatlakozva, várakozás user stream-re...")
-            await asyncio.wait_for(user_stream.connected.wait(), timeout=30.0)
-            log.info("User stream csatlakozva")
-        except asyncio.TimeoutError:
-            raise RuntimeError("WS API vagy user stream nem csatlakozott 30s alatt!")
+            await watchdog.stop()
+        except Exception: pass
+        try:
+            await reconciliation.stop()
+        except Exception: pass
+        try:
+            await profit_reporter.stop()
+        except Exception: pass
 
         try:
-            result = await ws_api._query("time", {}, authenticated=False)
-            server_ms = result["serverTime"]
-            local_ms = int(time.time() * 1000)
-            offset = server_ms - local_ms
-            from exchange.signing import set_time_offset
-            set_time_offset(offset)
-            if abs(offset) > 1000:
-                log.warning("Rendszeróra eltérés korrigálva", offset_ms=offset)
+            if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
+                await graceful_shutdown(settings, engine, ws_api, db_queue, symbol)
+                engine.status = "STOPPED"
             else:
-                log.info("Szerver idő szinkronizálva", offset_ms=offset)
+                log.info("Emergency állapot — graceful shutdown skip")
         except Exception as e:
-            log.warning("Szerver idő szinkron sikertelen, folytatás", error=str(e))
+            log.error("Graceful shutdown crash — last resort DB STOPPED", error=str(e))
+            # Last resort: közvetlen DB-frissítés a status-ra
+            if engine.bot_run_id:
+                try:
+                    from persistence.db import get_session as _gs
+                    from persistence.models import BotRun as _BR
+                    from sqlalchemy import update as _sa_update
+                    async with _gs() as _s:
+                        await _s.execute(
+                            _sa_update(_BR)
+                            .where(_BR.id == engine.bot_run_id)
+                            .values(status="STOPPED")
+                        )
+                        await _s.commit()
+                    log.info("Last resort DB STOPPED OK", run_id=engine.bot_run_id)
+                except Exception as e2:
+                    log.error("Last resort DB STOPPED is sikertelen", error=str(e2))
 
-        symbol = settings.bot.symbol
-        log.info("Open orders lekérdezés...", symbol=symbol)
-        existing_orders = await ws_api.get_open_orders(symbol)
-        bot_orders = [o for o in existing_orders if o.get("clientOrderId", "").startswith("G-")]
-
-        if bot_orders:
-            await _try_recovery(engine, ws_api, settings, bot_orders, db_queue)
-
-        if engine.status == "INITIALIZING":
-            from persistence.db import get_session
-            async with get_session() as session:
-                repo = BotRunRepo(session)
-                run = await repo.create({
-                    "symbol": settings.bot.symbol,
-                    "base_asset": settings.bot.base_asset,
-                    "quote_asset": settings.bot.quote_asset,
-                    "status": "INITIALIZING",
-                    "config_json": settings.bot.model_dump(mode="json"),
-                    "grid_type": settings.bot.grid_type,
-                    "total_capital_quote": settings.bot.total_capital_quote,
-                    "order_quote_value": settings.bot.order_quote_value,
-                    "target_net_profit_quote": settings.bot.target_net_profit_per_cycle_quote
-                    or settings.bot.target_profit_pct,
-                })
-                run_id = run.id
-            short_id = make_run_short_id(run_id)
-            log.info("Friss indítás: bot run létrehozva", run_id=run_id, short_id=short_id)
-            tg.create_task(engine.initialize(run_id, short_id), name="engine_init")
-
-        await _shutdown.wait()
-        log.info("Leállítás...")
-
-        await watchdog.stop()
-        await reconciliation.stop()
-        await profit_reporter.stop()
-
-        if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
-            await graceful_shutdown(settings, engine, ws_api, db_queue, symbol)
-            engine.status = "STOPPED"
-        else:
-            log.info("Emergency állapot — graceful shutdown skip")
-
-        await user_stream.stop()
-        await market_stream.stop()
-        await ws_api.stop()
-        await db_writer.stop()
-        uv_server.should_exit = True
+        for stopper, name in [
+            (user_stream.stop, "user_stream"),
+            (market_stream.stop, "market_stream"),
+            (ws_api.stop, "ws_api"),
+            (db_writer.stop, "db_writer"),
+        ]:
+            try:
+                await stopper()
+            except Exception as e:
+                log.warning(f"{name} stop hiba", error=str(e))
+        try:
+            uv_server.should_exit = True
+        except Exception:
+            pass
 
     await close_db()
-    log.info("Bot leállva")
+    if crash_error:
+        log.error("Bot leállva — CRASH miatt")
+    else:
+        log.info("Bot leállva — normál shutdown")
 
 
 if __name__ == "__main__":

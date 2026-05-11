@@ -106,6 +106,10 @@ class GridEngine:
         self._missed_levels: dict[int, "MissedLevel"] = {}
         # pair_id -> BUY fill quote — counter SELL profit-checkhez
         self._buy_fill_quote_by_pair: dict[str, Decimal] = {}
+        # Submit timestamps (ghost detection): cid -> monotonic_time
+        self._order_submit_ts: dict[str, float] = {}
+        # ACK-elt orderek (Binance NEW execution event érkezett rájuk)
+        self._order_acked_set: set[str] = set()
 
         self._cycle_seq = 0
         self._order_seq = 0
@@ -469,17 +473,40 @@ class GridEngine:
         log.info("Kezdeti order-ek bekülve", buy=buy_placed, sell=sell_placed)
 
     def _submit_level_order(self, level: GridLevel, cycle_id: int, pair_id: Optional[str] = None) -> str:
-        """Egy grid szint order-ét beküldi a routerbe. Anti-double védett."""
+        """Egy grid szint order-ét beküldi a routerbe. Anti-double védett, ghost override-tal."""
         assert self.router is not None
 
-        # Anti-double: ha már van élő order ezen a szinten, skip
+        # Anti-double: ha már van élő order ezen a szinten — DE ghost-detektálás:
+        # ha 30s régebbi és nincs ACK (Binance NEW), akkor ez egy elveszett SUBMIT_QUEUED → felülírjuk
         existing_cid = self._level_orders.get(level.index)
         if existing_cid:
-            log.warning(
-                "Skip duplicate submit",
-                lvl=level.index, side=level.side, existing_cid=existing_cid,
-            )
-            return existing_cid
+            submit_ts = self._order_submit_ts.get(existing_cid, 0.0)
+            age = time.monotonic() - submit_ts if submit_ts > 0 else 9999.0
+            is_acked = existing_cid in self._order_acked_set
+            if age > 30 and not is_acked:
+                log.warning(
+                    "Ghost SUBMIT_QUEUED override",
+                    lvl=level.index, side=level.side,
+                    ghost_cid=existing_cid, age_sec=int(age),
+                )
+                # Ghost cleanup → folytatjuk az új submit-tal
+                self._level_orders.pop(level.index, None)
+                # DB-ben is REJECTED-re állítjuk a ghost-ot
+                self.db_queue.put_nowait(DbEvent(
+                    type="update_order_local_state",
+                    data={
+                        "client_order_id": existing_cid,
+                        "state": "REJECTED",
+                        "reject_reason": f"Ghost SUBMIT_QUEUED no ACK after {int(age)}s",
+                    },
+                ))
+            else:
+                log.warning(
+                    "Skip duplicate submit",
+                    lvl=level.index, side=level.side,
+                    existing_cid=existing_cid, age_sec=int(age), acked=is_acked,
+                )
+                return existing_cid
 
         self._order_seq += 1
         cid = make_client_order_id(
@@ -508,6 +535,7 @@ class GridEngine:
         self._order_levels[cid] = level.index
         self._order_sides[cid] = level.side
         self._order_pairs[cid] = pair_id
+        self._order_submit_ts[cid] = time.monotonic()
         return cid
 
     async def on_execution_report(self, report: ExecutionReport) -> None:

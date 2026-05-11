@@ -153,7 +153,7 @@ class Reconciliation:
                 continue
             _, status_local, side, price, original_qty, pair_id = row
 
-            if status_local in ("REJECTED", "EXPIRED"):
+            if status_local in ("REJECTED", "EXPIRED", "SUBMIT_QUEUED"):
                 # MISSED-re téve (ha még nincs)
                 grid_line = self.engine.grid_map.get(level_index)
                 if grid_line and level_index not in self.engine._missed_levels:
@@ -169,6 +169,16 @@ class Reconciliation:
                         last_attempt_ms=make_timestamp(),
                     )
                 self.engine._level_orders.pop(level_index, None)
+                # SUBMIT_QUEUED ghost esetén DB-ben REJECTED-re átállítjuk
+                if status_local == "SUBMIT_QUEUED":
+                    self.engine.db_queue.put_nowait(DbEvent(
+                        type="update_order_local_state",
+                        data={
+                            "client_order_id": mem_cid,
+                            "state": "REJECTED",
+                            "reject_reason": "SUBMIT_QUEUED ghost (no exchange entry)",
+                        },
+                    ))
                 log.warning("Reconciliation: ghost CID MISSED-re téve",
                             cid=mem_cid, lvl=level_index, db_state=status_local)
             elif status_local == "FILLED":
