@@ -23,12 +23,19 @@ services:
 #      - ./configs/solusdc.yaml:/app/config.yaml:ro
 #      - ./logs/solusdc:/app/logs
 
-  bot-tiausdc:
+#  bot-tiausdc:
+#    <<: *bot-common
+#    container_name: kebo-grid-tiausdc
+#    volumes:
+#      - ./configs/tiausdc.yaml:/app/config.yaml:ro
+#      - ./logs/tiausdc:/app/logs
+
+  bot-dogsusdc:
     <<: *bot-common
-    container_name: kebo-grid-tiausdc
+    container_name: kebo-grid-dogsusdc
     volumes:
-      - ./configs/tiausdc.yaml:/app/config.yaml:ro
-      - ./logs/tiausdc:/app/logs
+      - ./configs/dogsusdc.yaml:/app/config.yaml:ro
+      - ./logs/dogsusdc:/app/logs
 
   # API service – user-facing: http://localhost:4080
   # NEM dependál konkrét bot konténerre — önállóan indul.
