@@ -37,6 +37,13 @@ services:
       - ./configs/dogsusdc.yaml:/app/config.yaml:ro
       - ./logs/dogsusdc:/app/logs
 
+  bot-dogeusdc:
+    <<: *bot-common
+    container_name: kebo-grid-dogeusdc
+    volumes:
+      - ./configs/dogeusdc.yaml:/app/config.yaml:ro
+      - ./logs/dogeusdc:/app/logs
+
   # API service – user-facing: http://localhost:4080
   # NEM dependál konkrét bot konténerre — önállóan indul.
   # Ha egy bot nem érhető el, a /status DB fallback-ot ad.
