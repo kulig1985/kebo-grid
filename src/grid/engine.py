@@ -110,6 +110,9 @@ class GridEngine:
         self._order_submit_ts: dict[str, float] = {}
         # ACK-elt orderek (Binance NEW execution event érkezett rájuk)
         self._order_acked_set: set[str] = set()
+        # Counter ACK várás: cid → {fill_transaction_time, side, lvl, pair_id}
+        # Ha NEW jön a counter CID-re, logoljuk a Binance-órán mért latency-t
+        self._pending_counter_acks: dict[str, dict] = {}
 
         self._cycle_seq = 0
         self._order_seq = 0
@@ -344,6 +347,12 @@ class GridEngine:
 
         # 6. Kezdeti order-ek elküldése (non-blocking)
         self.status = BotStatus.RUNNING
+
+        # DB-ben is RUNNING-ra állítjuk (különben INITIALIZING marad örökre)
+        self.db_queue.put_nowait(DbEvent(
+            type="update_bot_status",
+            data={"run_id": bot_run_id, "status": "RUNNING"},
+        ))
 
         # MISSED recovery callback regisztrálás a market stream-en
         if self.market_stream is not None:
@@ -761,12 +770,23 @@ class GridEngine:
 
         filled_grid_line = self.grid_map.get(level_index)
         if filled_grid_line and filled_grid_line.quantity > 0:
+            # Standard eset: a fillelő grid szint qty-jét használjuk
+            # (BUY szint qty = V/P, SELL szint qty = V/anchor → mindkettőre az inventory neutralitás
+            # garantálja hogy ez egyezik a fillen érkezett base-szel)
             qty = filled_grid_line.quantity
         else:
-            qty = round_down_to_step(
-                self.settings.bot.order_quote_value / counter_price,
-                self.symbol_info.lot_size.step_size,
-            )
+            # Fallback: anchor szint (qty=0) vagy ismeretlen → a TÉNYLEGES fillen kapott base
+            # (különben "lebegő" base maradna a wallet-ben)
+            if side == "BUY":
+                # BUY fillen érkezett base; ha BNB-fee, a base teljes; ha base-fee, levonjuk
+                qty = report.cumulative_filled_qty
+                if report.commission_asset == self.settings.bot.base_asset:
+                    qty -= report.commission_amount
+            else:
+                # SELL fillen visszakaptuk a quote-ot; a counter BUY-nak ennyi quote-ot kell elköltenie
+                # → counter BUY qty = quote / counter_price
+                qty = report.cumulative_quote_qty / counter_price
+            qty = round_down_to_step(qty, self.symbol_info.lot_size.step_size)
 
         counter_level = GridLevel(
             index=counter_index,
@@ -776,15 +796,44 @@ class GridEngine:
             notional=qty * counter_price,
             zone="ABOVE_ANCHOR" if counter_price > self.grid_map.get(0, grid_line).price else "BELOW_ANCHOR",
         )
-        self._submit_level_order(counter_level, cycle_id=self._cycle_seq, pair_id=pair_id)
+        counter_cid = self._submit_level_order(
+            counter_level, cycle_id=self._cycle_seq, pair_id=pair_id,
+        )
 
         sent_ms = make_timestamp()
         log.info("COUNTER", side=counter_side, lvl=counter_index,
                  price=counter_price.normalize(), qty=qty.normalize(),
                  value=f"{qty * counter_price:.2f}",
                  sent_at=_ms_to_timestr(sent_ms),
-                 latency_ms=sent_ms - report.transaction_time,
                  pair=pair_id)
+
+        # Counter ACK várás regisztráció — a NEW executionReport megérkezésekor
+        # logoljuk a Binance-órán mért latency-t (fill T0 → exchange-ACK T1)
+        self._pending_counter_acks[counter_cid] = {
+            "fill_transaction_time": report.transaction_time,
+            "side": counter_side,
+            "lvl": counter_index,
+            "pair_id": pair_id,
+        }
+
+    def on_counter_ack(self, report: ExecutionReport) -> None:
+        """
+        Hívandó amikor execution_type=NEW jön egy counter CID-re.
+        Logolja a Binance-órán mért fill→ACK latency-t (megbízhatóbb mint a lokális óra).
+        """
+        cid = report.client_order_id
+        pending = self._pending_counter_acks.pop(cid, None)
+        if pending is None:
+            return  # nem counter, vagy már ack-elt
+        # Binance órán mérve — sosem negatív, mert mindkét timestamp Binance-é
+        latency = report.event_time - pending["fill_transaction_time"]
+        log.info(
+            "COUNTER_ACK",
+            side=pending["side"], lvl=pending["lvl"],
+            accepted_at=_ms_to_timestr(report.event_time),
+            latency_ms=latency,
+            pair=pending["pair_id"],
+        )
 
     async def _execute_bootstrap(self) -> None:
         """Bootstrap: MARKET buy küldése a sell grid orderekhez szükséges base megszerzéséhez."""

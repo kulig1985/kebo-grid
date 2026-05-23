@@ -38,14 +38,19 @@ class MatchedPair:
 
 @dataclass
 class ProfitReport:
-    grid_profit: Decimal
+    grid_profit: Decimal              # realized: half-match párokból (BUY-SELL párok nettó profitja)
     total_buy_fees: Decimal
     total_sell_fees: Decimal
     completed_matches: int
     unmatched_buy_qty: Decimal
     unmatched_sell_qty: Decimal
-    portfolio_quote: Decimal     # wallet_base × current_price + wallet_quote
-    total_pnl: Decimal           # portfolio_quote − initial_capital_quote
+    portfolio_quote: Decimal          # wallet_base × current_price + wallet_quote
+    total_pnl: Decimal                # portfolio_quote − initial_capital_quote
+    # Inventory mark-to-market mezők (volatilitás profit):
+    avg_buy_vwap: Decimal             # össz BUY quote / össz BUY base (volume-weighted avg buy ár)
+    inventory_value_at_vwap: Decimal  # wallet_base × avg_buy_vwap
+    inventory_value_at_current: Decimal  # wallet_base × current_price
+    unrealized_pnl: Decimal           # inv_value_current − inv_value_at_vwap
     matches: list[MatchedPair] = field(default_factory=list)
 
 
@@ -116,6 +121,19 @@ def compute_half_match_profit(
     portfolio_quote = wallet_base * current_price + wallet_quote
     total_pnl = portfolio_quote - initial_capital_quote
 
+    # Inventory mark-to-market: a wallet-ben lévő open base mennyit ér jelenleg
+    # vs. amennyibe TÉNYLEGESEN került (volume-weighted avg buy price az ÖSSZES BUY-ra)
+    total_buy_quote_orig = sum((f.quote_qty for f in fills if f.side == "BUY"), Decimal("0"))
+    total_buy_base_orig = sum((f.quantity for f in fills if f.side == "BUY"), Decimal("0"))
+    if total_buy_base_orig > 0:
+        avg_buy_vwap = total_buy_quote_orig / total_buy_base_orig
+    else:
+        avg_buy_vwap = Decimal("0")
+
+    inventory_value_at_vwap = wallet_base * avg_buy_vwap
+    inventory_value_at_current = wallet_base * current_price
+    unrealized_pnl = inventory_value_at_current - inventory_value_at_vwap
+
     return ProfitReport(
         grid_profit=grid_profit,
         total_buy_fees=total_buy_fees,
@@ -125,6 +143,10 @@ def compute_half_match_profit(
         unmatched_sell_qty=unmatched_sell_qty,
         portfolio_quote=portfolio_quote,
         total_pnl=total_pnl,
+        avg_buy_vwap=avg_buy_vwap,
+        inventory_value_at_vwap=inventory_value_at_vwap,
+        inventory_value_at_current=inventory_value_at_current,
+        unrealized_pnl=unrealized_pnl,
         matches=matches,
     )
 

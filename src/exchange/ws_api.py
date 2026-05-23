@@ -141,6 +141,9 @@ class BinanceWsApi:
             max_size=10 * 1024 * 1024,
         )
         self._connect_time = time.monotonic()
+        # Warm-up: friss connection-nek "0 mp idő óta kapott üzenetet" számít,
+        # hogy az új kapcsolat ne számítson azonnal stale-nek a régi timer alapján.
+        self._last_msg_time = time.monotonic()
         self._connected.set()
         log.info("WS API csatlakozva")
 

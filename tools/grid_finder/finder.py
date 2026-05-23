@@ -22,7 +22,14 @@ import yaml
 
 
 REST_URL = "https://api.binance.com"
-USER_AGENT = "kebo-grid-finder/1.0"
+USER_AGENT = "kebo-grid-finder/2.0"
+
+# Kline interval → percek (napi-ekvivalens normalizáláshoz, paginációhoz)
+INTERVAL_MIN = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "8h": 480, "12h": 720,
+    "1d": 1440, "3d": 4320, "1w": 10080,
+}
 
 
 # ────────────────────────────────────────────────────────────────
@@ -34,10 +41,15 @@ def load_config(path: str) -> dict:
         cfg = yaml.safe_load(f)
     cfg.setdefault("quote_asset", "USDC")
     cfg.setdefault("lookback_days", 30)
+    cfg.setdefault("kline_interval", "15m")
     cfg.setdefault("exclude_symbols", [])
     cfg.setdefault("min_volume_24h_quote", 50000)
     cfg.setdefault("top_n", 30)
     cfg.setdefault("output_dir", "output")
+    cfg.setdefault("anchor_simulations", 5)
+    if cfg["kline_interval"] not in INTERVAL_MIN:
+        raise ValueError(f"Ismeretlen kline_interval: {cfg['kline_interval']}. "
+                         f"Engedélyezett: {list(INTERVAL_MIN.keys())}")
     bot = cfg.setdefault("bot", {})
     bot.setdefault("capital_quote", 55)
     bot.setdefault("quote_reserve_pct", 0.0)
@@ -83,6 +95,41 @@ def fetch_klines(client: httpx.Client, symbol: str, interval: str = "1d", limit:
     return r.json()
 
 
+def fetch_klines_paginated(
+    client: httpx.Client, symbol: str, interval: str, lookback_days: int,
+) -> list:
+    """Lapozott kline lekérés — Binance limit 1000/hívás."""
+    if interval not in INTERVAL_MIN:
+        raise ValueError(f"Ismeretlen interval: {interval}")
+    interval_ms = INTERVAL_MIN[interval] * 60 * 1000
+    end_ts = int(time.time() * 1000)
+    start_ts = end_ts - lookback_days * 86_400_000
+
+    all_klines: list = []
+    cur = start_ts
+    safety_max = 50  # max 50 batch (50k kline) — sanity
+    while cur < end_ts and safety_max > 0:
+        r = client.get(
+            "/api/v3/klines",
+            params={"symbol": symbol, "interval": interval,
+                    "startTime": cur, "limit": 1000},
+        )
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        all_klines.extend(batch)
+        last_close_time = batch[-1][6]
+        if last_close_time <= cur:
+            break
+        cur = last_close_time + 1
+        safety_max -= 1
+        # batch < 1000 → minden lekérdezve
+        if len(batch) < 1000:
+            break
+    return all_klines
+
+
 # ────────────────────────────────────────────────────────────────
 # Symbol filters parse
 # ────────────────────────────────────────────────────────────────
@@ -119,31 +166,44 @@ KLINE_COLS = [
 ]
 
 
-def compute_metrics(klines: list, ticker_24h: dict) -> dict:
-    """Lookback napos OHLCV → leíró metrikák."""
+def _candles_to_df(klines: list) -> pd.DataFrame:
     df = pd.DataFrame(klines, columns=KLINE_COLS)
     for c in ("open", "high", "low", "close", "volume", "quote_volume"):
         df[c] = df[c].astype(float)
+    df["close_time"] = df["close_time"].astype(int)
+    return df
 
-    if len(df) < 5:
-        raise ValueError(f"Túl kevés kline ({len(df)})")
 
-    # Log returns + realized vol
-    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
-    realized_vol_daily = df["log_ret"].std()
-    if math.isnan(realized_vol_daily):
-        realized_vol_daily = 0.0
-
-    # ATR (14)
-    df["tr"] = np.maximum.reduce([
+def _compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    tr = np.maximum.reduce([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift(1)).abs(),
         (df["low"] - df["close"].shift(1)).abs(),
     ])
-    atr_period = min(14, len(df))
-    atr = df["tr"].rolling(atr_period).mean().iloc[-1]
-    if math.isnan(atr):
-        atr = df["tr"].mean()
+    return pd.Series(tr).rolling(period).mean()
+
+
+def compute_metrics(klines: list, ticker_24h: dict, interval: str = "1d") -> dict:
+    """OHLCV → leíró metrikák. Interval-aware (15m, 1h, 1d, stb.)."""
+    df = _candles_to_df(klines)
+
+    if len(df) < 20:
+        raise ValueError(f"Túl kevés kline ({len(df)}) — legalább 20 kell")
+
+    periods_per_day = max(1, 1440 // INTERVAL_MIN[interval])
+
+    # Log returns — per-candle
+    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
+    realized_vol_per_candle = df["log_ret"].std()
+    if math.isnan(realized_vol_per_candle):
+        realized_vol_per_candle = 0.0
+    # Napi-ekvivalensre normalizálva (sqrt(N))
+    realized_vol_daily = realized_vol_per_candle * math.sqrt(periods_per_day)
+
+    # ATR (14 nap-ekvivalens)
+    atr_period = min(14 * periods_per_day, max(2, len(df) // 4))
+    atr_series = _compute_atr(df, atr_period)
+    atr = atr_series.iloc[-1] if not math.isnan(atr_series.iloc[-1]) else float(atr_series.dropna().mean() or 0)
     mean_close = df["close"].mean()
     atr_pct = (atr / mean_close * 100) if mean_close > 0 else 0.0
 
@@ -172,6 +232,7 @@ def compute_metrics(klines: list, ticker_24h: dict) -> dict:
 
     return {
         "realized_vol_daily": float(realized_vol_daily),
+        "realized_vol_weekly": float(realized_vol_daily * math.sqrt(7)),
         "realized_vol_annual": float(realized_vol_daily * math.sqrt(365)),
         "atr_pct": float(atr_pct),
         "range_pct_lookback": float(range_pct),
@@ -180,6 +241,143 @@ def compute_metrics(klines: list, ticker_24h: dict) -> dict:
         "volume_24h_quote": float(ticker_24h.get("quoteVolume", 0)),
         "current_price": float(df["close"].iloc[-1]),
     }
+
+
+# ────────────────────────────────────────────────────────────────
+# Hurst exponent (R/S analysis) — Mandelbrot 1972
+# ────────────────────────────────────────────────────────────────
+
+def compute_hurst_exponent(prices: np.ndarray, min_lag: int = 4, max_lag: int = 100) -> float:
+    """
+    Hurst exponent rescaled-range (R/S) analysis-szel.
+
+    Visszaad: H ∈ [0, 1]
+      - H < 0.5: mean-reverting (anti-persistent) — JÓ grid-nek
+      - H ≈ 0.5: random walk
+      - H > 0.5: trending (persistent) — ROSSZ grid-nek
+
+    Forrás: Mandelbrot & Wallis (1969), Hurst (1951).
+    """
+    prices = np.asarray(prices, dtype=float)
+    if len(prices) < 30:
+        return 0.5
+
+    # Log returns
+    log_returns = np.diff(np.log(prices[prices > 0]))
+    if len(log_returns) < min_lag * 2:
+        return 0.5
+
+    # Lags: kis és nagy időskálák között
+    actual_max = min(max_lag, len(log_returns) // 4)
+    if actual_max < min_lag + 2:
+        return 0.5
+    # Geometriai sorozat (kevesebb lag, gyorsabb)
+    lags = np.unique(np.geomspace(min_lag, actual_max, num=10).astype(int))
+
+    rs_values = []
+    valid_lags = []
+    for lag in lags:
+        n_chunks = len(log_returns) // lag
+        if n_chunks < 1:
+            continue
+        rs_per_chunk = []
+        for i in range(n_chunks):
+            chunk = log_returns[i * lag:(i + 1) * lag]
+            mean = chunk.mean()
+            dev = chunk - mean
+            cumdev = np.cumsum(dev)
+            R = cumdev.max() - cumdev.min()
+            S = chunk.std()
+            if S > 1e-12:
+                rs_per_chunk.append(R / S)
+        if rs_per_chunk:
+            rs_values.append(float(np.mean(rs_per_chunk)))
+            valid_lags.append(int(lag))
+
+    if len(rs_values) < 4:
+        return 0.5
+
+    # log-log lineáris regresszió: log(R/S) = H × log(lag) + c
+    log_lags = np.log(valid_lags)
+    log_rs = np.log(rs_values)
+    H, _ = np.polyfit(log_lags, log_rs, 1)
+    return float(np.clip(H, 0.0, 1.0))
+
+
+# ────────────────────────────────────────────────────────────────
+# Volume Profile / POC anchor jelöltek
+# ────────────────────────────────────────────────────────────────
+
+def compute_volume_profile_anchors(klines: list, n_bins: int = 50, top_n: int = 5) -> list[dict]:
+    """
+    Volume-súlyozott price hisztogram → top N density-csúcs (POC jelöltek).
+    A POC (Point of Control) az ipari standard: ahol a legtöbb forgalom volt.
+    """
+    df = _candles_to_df(klines)
+    if len(df) < 5:
+        return []
+    # Typical price = (H+L+C)/3 — standard VP módszer
+    tp = ((df["high"] + df["low"] + df["close"]) / 3).values
+    weights = df["volume"].values
+    if weights.sum() <= 0:
+        weights = np.ones_like(weights)  # ha nincs volume, idő-súlyozás
+
+    lo, hi = float(df["low"].min()), float(df["high"].max())
+    if hi <= lo:
+        return [{"price": float(df["close"].iloc[-1]), "density": 1.0, "volume_share": 1.0}]
+    bin_edges = np.linspace(lo, hi, n_bins + 1)
+    hist, _ = np.histogram(tp, bins=bin_edges, weights=weights)
+    centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    total = hist.sum()
+    if total <= 0:
+        return []
+
+    # Local maxima keresése (egyszerű)
+    peaks = []
+    for i in range(1, len(hist) - 1):
+        if hist[i] > hist[i - 1] and hist[i] > hist[i + 1]:
+            peaks.append({
+                "price": float(centers[i]),
+                "density": float(hist[i]),
+                "volume_share": float(hist[i] / total),
+            })
+    # Ha nincs jó local maximum (monoton hist), az abszolút max-ot vesszük
+    if not peaks:
+        idx = int(np.argmax(hist))
+        peaks.append({
+            "price": float(centers[idx]),
+            "density": float(hist[idx]),
+            "volume_share": float(hist[idx] / total),
+        })
+    peaks.sort(key=lambda p: -p["density"])
+    return peaks[:top_n]
+
+
+# ────────────────────────────────────────────────────────────────
+# Recency weight (ATR_recent / ATR_full arány)
+# ────────────────────────────────────────────────────────────────
+
+def compute_recency_weight(klines: list, interval: str, recent_days: int = 7) -> float:
+    """ATR_recent / ATR_full arány — clipped 0.3..2.0.
+    <0.7 = csillapodó vol (büntetés), >1.3 = növekvő vol (bónusz)."""
+    df = _candles_to_df(klines)
+    periods_per_day = max(1, 1440 // INTERVAL_MIN[interval])
+    n_recent = recent_days * periods_per_day
+    atr_period = min(14 * periods_per_day, max(2, len(df) // 4))
+
+    if len(df) < n_recent + atr_period or len(df) < 50:
+        return 1.0
+
+    atr_full_series = _compute_atr(df, atr_period)
+    atr_recent_series = _compute_atr(df.tail(n_recent).reset_index(drop=True),
+                                      min(atr_period, max(2, n_recent // 4)))
+    atr_full = atr_full_series.dropna().iloc[-1] if len(atr_full_series.dropna()) else 0
+    atr_recent = atr_recent_series.dropna().iloc[-1] if len(atr_recent_series.dropna()) else 0
+
+    if atr_full <= 0:
+        return 1.0
+    ratio = atr_recent / atr_full
+    return float(np.clip(ratio, 0.3, 2.0))
 
 
 # ────────────────────────────────────────────────────────────────
@@ -246,16 +444,182 @@ def simulate_bot(metrics: dict, filters: dict, bot_cfg: dict) -> dict:
 
 
 # ────────────────────────────────────────────────────────────────
+# Multi-anchor szimuláció
+# ────────────────────────────────────────────────────────────────
+
+def _empty_anchor_result() -> dict:
+    return {
+        "anchor_results": [], "hurst_exponent": 0.5,
+        "median_profit": 0.0, "min_profit": 0.0, "max_profit": 0.0,
+        "median_profit_per_day": 0.0, "min_profit_per_day": 0.0, "max_profit_per_day": 0.0,
+        "median_out_of_range_pct": 0.0, "max_out_of_range_pct": 0.0,
+        "median_crossings": 0.0, "best_anchor_price": 0.0,
+        "vp_anchors": [],
+    }
+
+
+def simulate_anchor_v2(
+    df: pd.DataFrame, anchor_price: float, sim: dict, interval: str,
+) -> dict:
+    """
+    Egy anchor-ra: minden grid szintre megszámolja a candle-átmenetek számát.
+
+    cycle = floor(crossings / 2) per szint (egy le-fel kéne legalább 2 metszéshez)
+    """
+    K = int(sim["K"])
+    step = float(sim["step_pct"]) / 100
+    profit_per_cycle = float(sim["profit_per_cycle"])
+    periods_per_day = max(1, 1440 // INTERVAL_MIN[interval])
+
+    if K <= 0 or step <= 0 or anchor_price <= 0 or len(df) == 0:
+        return {"anchor_price": anchor_price, "total_crossings": 0, "total_cycles": 0,
+                "profit": 0.0, "profit_per_day": 0.0, "out_of_range_pct": 0.0,
+                "grid_low": anchor_price, "grid_high": anchor_price, "duration_days": 0.0,
+                "hot_levels": []}
+
+    # K BUY + K SELL szint anchor körül (geometric)
+    levels = np.array(sorted(
+        [anchor_price / ((1 + step) ** i) for i in range(1, K + 1)] +
+        [anchor_price * ((1 + step) ** i) for i in range(1, K + 1)]
+    ))
+    grid_low = float(levels[0])
+    grid_high = float(levels[-1])
+
+    high = df["high"].values
+    low = df["low"].values
+    out_of_range = int(((high < grid_low) | (low > grid_high)).sum())
+
+    # Per-szint crossings: vektorizált
+    # crossings[i] = hány candle-ra igaz: low[c] <= levels[i] <= high[c]
+    crossings = np.zeros(len(levels), dtype=int)
+    for i, lv in enumerate(levels):
+        crossings[i] = int(((low <= lv) & (lv <= high)).sum())
+
+    total_crossings = int(crossings.sum())
+    # Egy cycle = oda-vissza átkelés ≈ 2 metszés
+    total_cycles = int((crossings // 2).sum())
+    profit = total_cycles * profit_per_cycle
+
+    duration_days = len(df) / periods_per_day
+    profit_per_day = profit / duration_days if duration_days > 0 else 0.0
+    out_pct = out_of_range / len(df) * 100 if len(df) > 0 else 0.0
+
+    # Hot levels: top 3 legtöbbet metszett szint
+    hot_idx = np.argsort(-crossings)[:3]
+    hot_levels = [
+        {"price": float(levels[i]), "crossings": int(crossings[i])}
+        for i in hot_idx if crossings[i] > 0
+    ]
+
+    return {
+        "anchor_price": float(anchor_price),
+        "grid_low": grid_low, "grid_high": grid_high,
+        "total_crossings": total_crossings,
+        "total_cycles": total_cycles,
+        "profit": float(profit),
+        "profit_per_day": float(profit_per_day),
+        "out_of_range_pct": float(out_pct),
+        "duration_days": float(duration_days),
+        "hot_levels": hot_levels,
+    }
+
+
+def simulate_anchors(
+    klines: list, sim: dict, interval: str, n_anchors: int = 5,
+) -> dict:
+    """
+    v3: Volume Profile (POC) alapú anchor jelöltek + per-szint crossings + Hurst exponent.
+
+    Algoritmus:
+    1. Top N POC anchor jelölt a Volume Profile-ből
+    2. Mindegyikre simulate_anchor_v2 (per-szint crossings)
+    3. Hurst exponent a teljes árra
+    """
+    df = _candles_to_df(klines)
+    total = len(df)
+    if total < 30 or sim["K"] <= 0 or sim["step_pct"] <= 0:
+        return _empty_anchor_result()
+
+    # 1. POC anchor jelöltek
+    vp_anchors = compute_volume_profile_anchors(klines, n_bins=50, top_n=n_anchors)
+    if not vp_anchors:
+        # Fallback: egyenletesen elosztott anchor-ok az ár-tartományból
+        prices = np.linspace(df["low"].min(), df["high"].max(), n_anchors)
+        vp_anchors = [{"price": float(p), "density": 0, "volume_share": 0} for p in prices]
+
+    # 2. Per-anchor szimuláció (per-szint crossings)
+    results = []
+    for vp in vp_anchors:
+        r = simulate_anchor_v2(df, vp["price"], sim, interval)
+        r["volume_share"] = vp.get("volume_share", 0)
+        r["density"] = vp.get("density", 0)
+        results.append(r)
+
+    # 3. Hurst exponent (teljes close árra)
+    hurst = compute_hurst_exponent(df["close"].values)
+
+    # 4. Aggregátumok
+    profits = [r["profit"] for r in results]
+    profits_per_day = [r["profit_per_day"] for r in results]
+    out_pcts = [r["out_of_range_pct"] for r in results]
+    crossings_all = [r["total_crossings"] for r in results]
+    best_idx = int(np.argmax(profits_per_day)) if profits_per_day else 0
+
+    return {
+        "anchor_results": results,
+        "vp_anchors": vp_anchors,
+        "hurst_exponent": hurst,
+        "median_profit": float(np.median(profits)) if profits else 0.0,
+        "min_profit": float(np.min(profits)) if profits else 0.0,
+        "max_profit": float(np.max(profits)) if profits else 0.0,
+        "median_profit_per_day": float(np.median(profits_per_day)) if profits_per_day else 0.0,
+        "min_profit_per_day": float(np.min(profits_per_day)) if profits_per_day else 0.0,
+        "max_profit_per_day": float(np.max(profits_per_day)) if profits_per_day else 0.0,
+        "median_out_of_range_pct": float(np.median(out_pcts)) if out_pcts else 0.0,
+        "max_out_of_range_pct": float(np.max(out_pcts)) if out_pcts else 0.0,
+        "median_crossings": float(np.median(crossings_all)) if crossings_all else 0.0,
+        "best_anchor_price": float(results[best_idx]["anchor_price"]) if results else 0.0,
+    }
+
+
+# ────────────────────────────────────────────────────────────────
 # Score
 # ────────────────────────────────────────────────────────────────
 
-def grid_score(metrics: dict, sim: dict) -> float:
-    """Kombinált rangsor — magas score = jó grid jelölt."""
-    epd = sim["est_profit_per_day"]
+def grid_score(
+    metrics: dict, sim: dict,
+    anchor_sim: Optional[dict] = None, recency_weight: float = 1.0,
+) -> float:
+    """
+    Kombinált rangsor — magas score = jó grid jelölt.
+
+    Komponensek (v3):
+    - epd_anchor: a multi-anchor szimuláció median profit/day-je (per-szint crossings)
+    - out_penalty: range-out büntetés (max −70%)
+    - recency_weight: ATR_recent / ATR_full (0.3..2.0 clipped)
+    - hurst_factor: Hurst exponent alapú szorzó (mean-reverting bónusz, trending büntetés)
+    """
+    if anchor_sim and anchor_sim.get("median_profit_per_day", 0) > 0:
+        epd = float(anchor_sim["median_profit_per_day"])
+    else:
+        epd = float(sim["est_profit_per_day"])
+
+    out_pct = float(anchor_sim.get("median_out_of_range_pct", 0)) if anchor_sim else 0.0
+    out_penalty = max(0.3, 1.0 - min(out_pct / 100, 0.7))
+
+    # Hurst: <0.4 mean-reverting (jó), >0.6 trending (rossz)
+    hurst = float(anchor_sim.get("hurst_exponent", 0.5)) if anchor_sim else 0.5
+    if hurst < 0.4:
+        hurst_factor = 1.3
+    elif hurst > 0.6:
+        hurst_factor = 0.6
+    else:
+        hurst_factor = 1.0
+
     ranging = 1 - 0.5 * metrics["trend_strength"]
     liq = min(metrics["volume_24h_quote"] / 100_000, 5.0)
     k_factor = 1.0 if sim["K"] >= 3 else 0.3
-    return float(epd * ranging * liq * k_factor)
+    return float(epd * ranging * liq * k_factor * out_penalty * recency_weight * hurst_factor)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -299,13 +663,48 @@ def main(config_path: str, from_csv: bool = False) -> None:
                 "base_asset": row.get("base_asset", ""),
             }
             sim = simulate_bot(metrics, filters, cfg["bot"])
-            score = grid_score(metrics, sim)
+            # Anchor-szim adatok megőrzése a régi CSV-ből (ha vannak)
+            anchor_sim = {
+                "median_profit": row.get("anchor_median_profit", 0),
+                "min_profit": row.get("anchor_min_profit", 0),
+                "max_profit": row.get("anchor_max_profit", 0),
+                "median_profit_per_day": row.get("anchor_median_profit_per_day", 0),
+                "min_profit_per_day": row.get("anchor_min_profit_per_day", 0),
+                "max_profit_per_day": row.get("anchor_max_profit_per_day", 0),
+                "median_out_of_range_pct": row.get("out_of_range_pct", 0),
+                "max_out_of_range_pct": row.get("max_out_of_range_pct", 0),
+                "hurst_exponent": row.get("hurst_exponent", 0.5),
+            } if "anchor_median_profit" in row else None
+            recency_w = float(row.get("recency_weight", 1.0))
+            score = grid_score(metrics, sim, anchor_sim=anchor_sim, recency_weight=recency_w)
+            extras = {
+                "anchor_median_profit": anchor_sim["median_profit"] if anchor_sim else 0,
+                "anchor_min_profit": anchor_sim["min_profit"] if anchor_sim else 0,
+                "anchor_max_profit": anchor_sim["max_profit"] if anchor_sim else 0,
+                "anchor_median_profit_per_day": anchor_sim["median_profit_per_day"] if anchor_sim else 0,
+                "anchor_min_profit_per_day": anchor_sim["min_profit_per_day"] if anchor_sim else 0,
+                "anchor_max_profit_per_day": anchor_sim["max_profit_per_day"] if anchor_sim else 0,
+                "out_of_range_pct": anchor_sim["median_out_of_range_pct"] if anchor_sim else 0,
+                "max_out_of_range_pct": anchor_sim["max_out_of_range_pct"] if anchor_sim else 0,
+                "recency_weight": recency_w,
+                "hurst_exponent": row.get("hurst_exponent", 0.5),
+                "best_anchor_price": row.get("best_anchor_price", 0),
+                "median_crossings": row.get("median_crossings", 0),
+                "vp_anchor_1_price": row.get("vp_anchor_1_price", 0),
+                "vp_anchor_1_share": row.get("vp_anchor_1_share", 0),
+                "vp_anchor_2_price": row.get("vp_anchor_2_price", 0),
+                "vp_anchor_2_share": row.get("vp_anchor_2_share", 0),
+                "vp_anchor_3_price": row.get("vp_anchor_3_price", 0),
+                "vp_anchor_3_share": row.get("vp_anchor_3_share", 0),
+                "interval": row.get("interval", cfg["kline_interval"]),
+            }
             results.append({
                 "symbol": row["symbol"],
                 "base_asset": filters["base_asset"],
                 **{k: v for k, v in filters.items() if k != "base_asset"},
                 **metrics,
                 **sim,
+                **extras,
                 "score": score,
             })
         df = pd.DataFrame(results).sort_values("score", ascending=False).reset_index(drop=True)
@@ -346,30 +745,62 @@ def main(config_path: str, from_csv: bool = False) -> None:
         ]
         print(f"      → {len(symbols)} symbol after liquidity filter ({min_vol:.0f} {quote}/24h)")
 
-        # 4. per-symbol klines + metrics + simulate
-        print(f"[3/4] Per-symbol kline + metrika + szimuláció ({len(symbols)} symbol)...")
+        # 4. per-symbol klines + metrics + simulate (interval-aware paginated)
+        interval = cfg["kline_interval"]
+        n_anchors = int(cfg["anchor_simulations"])
+        periods_per_day = max(1, 1440 // INTERVAL_MIN[interval])
+        expected_klines = lookback * periods_per_day
+        print(f"[3/4] Per-symbol kline + metrika + szimuláció "
+              f"({len(symbols)} symbol, interval={interval}, ~{expected_klines} kline/symbol)...")
         results = []
         for i, s in enumerate(symbols, 1):
             sym = s["symbol"]
             print(f"      [{i}/{len(symbols)}] {sym:20s}", end="\r", flush=True)
             try:
-                klines = fetch_klines(client, sym, "1d", lookback)
-                if len(klines) < min(lookback - 2, 5):
+                klines = fetch_klines_paginated(client, sym, interval, lookback)
+                if len(klines) < 20:
                     continue
                 filters = parse_symbol_filters(s)
-                metrics = compute_metrics(klines, tickers[sym])
+                metrics = compute_metrics(klines, tickers[sym], interval)
                 sim = simulate_bot(metrics, filters, cfg["bot"])
-                score = grid_score(metrics, sim)
+                anchor_sim = simulate_anchors(klines, sim, interval, n_anchors)
+                recency_w = compute_recency_weight(klines, interval, recent_days=7)
+                score = grid_score(metrics, sim, anchor_sim=anchor_sim,
+                                   recency_weight=recency_w)
+                vp_top = anchor_sim.get("vp_anchors", [])
+                extras = {
+                    "interval": interval,
+                    "hurst_exponent": anchor_sim.get("hurst_exponent", 0.5),
+                    "best_anchor_price": anchor_sim.get("best_anchor_price", 0),
+                    "median_crossings": anchor_sim.get("median_crossings", 0),
+                    "anchor_median_profit": anchor_sim.get("median_profit", 0),
+                    "anchor_min_profit": anchor_sim.get("min_profit", 0),
+                    "anchor_max_profit": anchor_sim.get("max_profit", 0),
+                    "anchor_median_profit_per_day": anchor_sim.get("median_profit_per_day", 0),
+                    "anchor_min_profit_per_day": anchor_sim.get("min_profit_per_day", 0),
+                    "anchor_max_profit_per_day": anchor_sim.get("max_profit_per_day", 0),
+                    "out_of_range_pct": anchor_sim.get("median_out_of_range_pct", 0),
+                    "max_out_of_range_pct": anchor_sim.get("max_out_of_range_pct", 0),
+                    "recency_weight": recency_w,
+                    # Top 3 POC anchor (price + share)
+                    "vp_anchor_1_price": vp_top[0]["price"] if len(vp_top) >= 1 else 0,
+                    "vp_anchor_1_share": vp_top[0]["volume_share"] if len(vp_top) >= 1 else 0,
+                    "vp_anchor_2_price": vp_top[1]["price"] if len(vp_top) >= 2 else 0,
+                    "vp_anchor_2_share": vp_top[1]["volume_share"] if len(vp_top) >= 2 else 0,
+                    "vp_anchor_3_price": vp_top[2]["price"] if len(vp_top) >= 3 else 0,
+                    "vp_anchor_3_share": vp_top[2]["volume_share"] if len(vp_top) >= 3 else 0,
+                }
                 results.append({
                     "symbol": sym,
                     "base_asset": filters["base_asset"],
                     **{k: v for k, v in filters.items() if k != "base_asset"},
                     **metrics,
                     **sim,
+                    **extras,
                     "score": score,
                 })
-                # gyenge rate-limit elkerülés
-                time.sleep(0.05)
+                # gyenge rate-limit elkerülés (paginated -> kicsi)
+                time.sleep(0.02)
             except Exception as e:
                 print(f"\n[!] {sym}: {type(e).__name__}: {e}")
         print()
@@ -535,6 +966,23 @@ logging:
 # HTML report
 # ────────────────────────────────────────────────────────────────
 
+def _format_price(p) -> str:
+    """Adaptív ár-formázás: kis árak több tizedessel."""
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return "—"
+    if p == 0:
+        return "0"
+    if p < 0.001:
+        return f"{p:.8f}".rstrip("0").rstrip(".")
+    if p < 1:
+        return f"{p:.6f}".rstrip("0").rstrip(".")
+    if p < 100:
+        return f"{p:.4f}"
+    return f"{p:.2f}"
+
+
 def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
     top_n = int(cfg["top_n"])
     top = df.head(top_n)
@@ -546,14 +994,22 @@ def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
         if mn <= 5.0: return "#fff3cd"   # sárga — standard
         return "#f8d7da"                 # piros — drága szintek
 
+    def _hurst_color(h: float) -> str:
+        if h < 0.4: return "#d4edda"   # zöld — mean-reverting (jó)
+        if h > 0.6: return "#f8d7da"   # piros — trending (rossz)
+        return "#fff3cd"               # sárga — random walk
+
     minnot_colors = [_minnot_color(m) for m in top["min_notional"]]
+    hurst_colors = [_hurst_color(h) for h in top.get("hurst_exponent", pd.Series([0.5]*len(top)))]
     row_fills = ["#ecf0f1" if i % 2 == 0 else "white" for i in range(len(top))]
+    has_hurst = "hurst_exponent" in top.columns
 
     table_fig = go.Figure(data=[go.Table(
-        columnwidth=[28, 95, 35, 50, 55, 50, 55, 45, 70, 70, 55, 65, 65, 55],
+        columnwidth=[28, 95, 35, 50, 55, 50, 55, 45, 50, 70, 70, 55, 65, 65, 55],
         header=dict(
             values=["#", "Symbol", "K", "Step%", "Vol(d)%", "ATR%", "Range%",
-                    "Trend", "Vol24h(k)", "<b>MinNot USDC</b>", "Cycle/d", "Profit/d", "Days→100", "Score"],
+                    "Trend(R²)", "<b>Hurst</b>", "Vol24h(k)", "<b>MinNot USDC</b>",
+                    "Cycle/d", "Profit/d", "Days→100", "Score"],
             fill_color="#2c3e50", font=dict(color="white", size=12), align="left",
         ),
         cells=dict(
@@ -566,6 +1022,7 @@ def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
                 top["atr_pct"].round(2),
                 top["range_pct_lookback"].round(1),
                 top["trend_strength"].round(2),
+                top["hurst_exponent"].round(2) if has_hurst else ["–"]*len(top),
                 (top["volume_24h_quote"] / 1000).round(0),
                 top["min_notional"].round(2),
                 top["est_cycles_per_day"].round(1),
@@ -575,18 +1032,23 @@ def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
             ],
             fill_color=[
                 row_fills, row_fills, row_fills, row_fills, row_fills,
-                row_fills, row_fills, row_fills, row_fills,
-                minnot_colors,  # <-- min_notional színezve
+                row_fills, row_fills, row_fills,
+                hurst_colors,    # <-- Hurst színezve
+                row_fills,
+                minnot_colors,   # <-- min_notional színezve
                 row_fills, row_fills, row_fills, row_fills,
             ],
             align="left", font=dict(size=11),
         ),
     )])
     table_fig.update_layout(
-        title=f"Top {top_n} {cfg['quote_asset']} grid jelölt (score szerint) — <b>MinNot</b> oszlop "
-              f"<span style='background:#d4edda'>zöld≤1</span> "
-              f"<span style='background:#fff3cd'>sárga≤5</span> "
-              f"<span style='background:#f8d7da'>piros>5</span>",
+        title=f"Top {top_n} {cfg['quote_asset']} grid jelölt (score szerint) — "
+              f"<b>Hurst</b> <span style='background:#d4edda'>&lt;0.4 mean-rev</span> "
+              f"<span style='background:#fff3cd'>0.4-0.6 random</span> "
+              f"<span style='background:#f8d7da'>&gt;0.6 trending</span> | "
+              f"<b>MinNot</b> <span style='background:#d4edda'>≤1</span> "
+              f"<span style='background:#fff3cd'>≤5</span> "
+              f"<span style='background:#f8d7da'>&gt;5</span>",
         height=min(900, 60 + 28 * len(top)),
     )
 
@@ -632,6 +1094,146 @@ def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
         yaxis_title=f"Becsült profit / nap ({cfg['quote_asset']})",
         height=500,
     )
+
+    # 3.b Multi-anchor szimuláció — bar + errorbar (csak ha vannak anchor adatok)
+    has_anchor = "anchor_median_profit_per_day" in top.columns and (
+        top["anchor_median_profit_per_day"].fillna(0).abs().sum() > 0
+    )
+    if has_anchor:
+        anc_n = min(15, len(top))
+        anc_top = top.head(anc_n)
+        median = anc_top["anchor_median_profit_per_day"]
+        mn = anc_top["anchor_min_profit_per_day"]
+        mx = anc_top["anchor_max_profit_per_day"]
+        out_pct = anc_top["out_of_range_pct"]
+        # Színkód: ha out_of_range > 30 → piros figyelmeztetés
+        bar_colors = ["#e74c3c" if op > 30 else "#3498db" for op in out_pct]
+        anchor_bar = go.Figure()
+        anchor_bar.add_trace(go.Bar(
+            x=anc_top["symbol"], y=median,
+            error_y=dict(
+                type="data",
+                array=(mx - median).clip(lower=0),
+                arrayminus=(median - mn).clip(lower=0),
+                visible=True, color="#34495e", thickness=1.5,
+            ),
+            marker_color=bar_colors,
+            text=[f"{v:.3f}" for v in median],
+            textposition="outside",
+            customdata=list(zip(out_pct, anc_top.get("recency_weight", [1.0]*len(anc_top)))),
+            hovertemplate=(
+                "<b>%{x}</b><br>"
+                "Median profit/d: %{y:.4f}<br>"
+                "Out of range: %{customdata[0]:.1f}%<br>"
+                "Recency weight: %{customdata[1]:.2f}<extra></extra>"
+            ),
+        ))
+        anchor_bar.update_layout(
+            title=f"Multi-anchor szimuláció (top {anc_n}) — median profit/nap, "
+                  f"hibasáv = min/max különböző anchor-okból. "
+                  f"<span style='color:#e74c3c'>Piros = >30% out-of-range</span>",
+            xaxis_title="Symbol",
+            yaxis_title=f"Profit / nap ({cfg['quote_asset']})",
+            height=520,
+        )
+        anchor_bar_html = anchor_bar.to_html(full_html=False, include_plotlyjs=False)
+
+        # Multi-anchor tábla: top 10 részletes
+        anc_table_n = min(10, len(top))
+        atop = top.head(anc_table_n)
+        out_colors = [
+            "#f8d7da" if v > 30 else ("#fff3cd" if v > 10 else "#d4edda")
+            for v in atop["out_of_range_pct"]
+        ]
+        rec_colors = [
+            "#f8d7da" if v < 0.7 else ("#fff3cd" if v < 0.9 else "#d4edda")
+            for v in atop.get("recency_weight", [1.0]*len(atop))
+        ]
+        anchor_table = go.Figure(data=[go.Table(
+            columnwidth=[35, 90, 70, 65, 65, 65, 70, 70],
+            header=dict(
+                values=["#", "Symbol", "Median P/d", "Min P/d", "Max P/d",
+                        "P/d Spread", "Out-Range%", "Recency"],
+                fill_color="#2c3e50", font=dict(color="white", size=12), align="left",
+            ),
+            cells=dict(
+                values=[
+                    list(range(1, anc_table_n + 1)),
+                    atop["symbol"],
+                    atop["anchor_median_profit_per_day"].round(4),
+                    atop["anchor_min_profit_per_day"].round(4),
+                    atop["anchor_max_profit_per_day"].round(4),
+                    (atop["anchor_max_profit_per_day"] - atop["anchor_min_profit_per_day"]).round(4),
+                    atop["out_of_range_pct"].round(1),
+                    atop.get("recency_weight", pd.Series([1.0]*anc_table_n)).round(2),
+                ],
+                fill_color=[
+                    ["white"]*anc_table_n, ["white"]*anc_table_n,
+                    ["white"]*anc_table_n, ["white"]*anc_table_n, ["white"]*anc_table_n,
+                    ["white"]*anc_table_n,
+                    out_colors, rec_colors,
+                ],
+                align="left", font=dict(size=11),
+            ),
+        )])
+        anchor_table.update_layout(
+            title=f"Multi-anchor részletek (top {anc_table_n}) — "
+                  f"<span style='background:#d4edda'>zöld out%≤10</span> "
+                  f"<span style='background:#fff3cd'>sárga ≤30</span> "
+                  f"<span style='background:#f8d7da'>piros >30</span>; "
+                  f"recency: <0.7 csillapodó, >0.9 stabil",
+            height=min(700, 60 + 28 * anc_table_n),
+        )
+        anchor_table_html = anchor_table.to_html(full_html=False, include_plotlyjs=False)
+    else:
+        anchor_bar_html = "<p><i>Nincs anchor szimuláció adat (régi CSV-ből futtatva offline módban).</i></p>"
+        anchor_table_html = ""
+
+    # 3.c Volume Profile (POC) anchor jelöltek táblázat
+    has_vp = "vp_anchor_1_price" in top.columns and (top["vp_anchor_1_price"].fillna(0).abs().sum() > 0)
+    if has_vp:
+        vp_n = min(10, len(top))
+        vp_top_df = top.head(vp_n)
+        # POC vs current price diff %
+        def _diff_pct(poc, cur):
+            if cur <= 0 or poc <= 0:
+                return 0.0
+            return (poc - cur) / cur * 100
+        diff_1 = [_diff_pct(p, c) for p, c in zip(vp_top_df["vp_anchor_1_price"], vp_top_df["current_price"])]
+        diff_best = [_diff_pct(p, c) for p, c in zip(vp_top_df["best_anchor_price"], vp_top_df["current_price"])]
+        vp_table = go.Figure(data=[go.Table(
+            columnwidth=[35, 90, 80, 80, 70, 80, 70, 80, 70, 90],
+            header=dict(
+                values=["#", "Symbol", "Current Price", "Best Anchor",
+                        "Δ% (best vs cur)", "POC #1", "Share #1",
+                        "POC #2", "Share #2", "POC #3"],
+                fill_color="#2c3e50", font=dict(color="white", size=12), align="left",
+            ),
+            cells=dict(
+                values=[
+                    list(range(1, vp_n + 1)),
+                    vp_top_df["symbol"],
+                    [_format_price(p) for p in vp_top_df["current_price"]],
+                    [_format_price(p) for p in vp_top_df["best_anchor_price"]],
+                    [f"{d:+.2f}%" for d in diff_best],
+                    [_format_price(p) for p in vp_top_df["vp_anchor_1_price"]],
+                    [f"{s*100:.1f}%" for s in vp_top_df["vp_anchor_1_share"]],
+                    [_format_price(p) for p in vp_top_df["vp_anchor_2_price"]],
+                    [f"{s*100:.1f}%" for s in vp_top_df["vp_anchor_2_share"]],
+                    [_format_price(p) for p in vp_top_df["vp_anchor_3_price"]],
+                ],
+                align="left", font=dict(size=11),
+            ),
+        )])
+        vp_table.update_layout(
+            title=f"Volume Profile / POC anchor jelöltek (top {vp_n}) — "
+                  f"<i>Best anchor</i> = a multi-anchor szim legmagasabb profit/d eredménye. "
+                  f"<i>POC #1-3</i> = top 3 volume-density csúcs.",
+            height=min(700, 60 + 28 * vp_n),
+        )
+        vp_table_html = vp_table.to_html(full_html=False, include_plotlyjs=False)
+    else:
+        vp_table_html = ""
 
     # 4. Sensitivity heatmap — különböző target_profit_pct
     target_pcts = [0.001, 0.002, 0.005, 0.01, 0.02, 0.04]
@@ -745,6 +1347,14 @@ def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
 <div class="section">{scatter.to_html(full_html=False, include_plotlyjs=False)}</div>
 <div class="section">{bar_fig.to_html(full_html=False, include_plotlyjs=False)}</div>
 
+<h2>🎯 Multi-anchor szimuláció (v3 — Volume Profile + per-szint crossings)</h2>
+<p><b>Anchor jelöltek:</b> Volume Profile / POC alapján (top {cfg.get('anchor_simulations', 5)} legmagasabb forgalom-density csúcs).
+<b>Cycle becslés:</b> minden grid szintre megszámoljuk hányszor metszett az ár (low ≤ szint ≤ high), majd <code>cycles = floor(crossings/2)</code> per szint. Ez sokkal pontosabb mint a v2 globális heurisztikája.
+<b>Out of range</b> = hány candle volt teljesen kívül a grid sávján. <i>Mat. alap: empirikus eloszlás módusza (POC) + szint-átkelési statisztika.</i></p>
+<div class="section">{anchor_bar_html}</div>
+<div class="section">{anchor_table_html}</div>
+<div class="section">{vp_table_html}</div>
+
 <h2>🔥 Érzékenység vizsgálat</h2>
 <p>Hogyan változik a becsült profit/nap különböző <code>target_profit_pct</code> érték mellett
 (ugyanaz a tőke, ugyanaz a fee). Sárgább = nagyobb profit. <b>Figyeld meg:</b> a túl alacsony target
@@ -803,8 +1413,29 @@ def _build_glossary_html(cfg: dict) -> str:
                       "Feltételezi hogy <b>K szint párhuzamosan termel</b> (optimista)."),
         ("Days→100", f"Hány nap kell <b>100 {quote} profit</b> eléréséhez: <code>100 / Profit/d</code>. "
                       "Ha túl magas → kis-tőkés bot strukturálisan nem éri el rövid távon."),
-        ("Score", "Kombinált rangsor: <code>Profit/d × (1 − 0.5 × Trend) × min(Vol24h/100k, 5) × K_factor</code>. "
-                   "K_factor = 1 ha K≥3, különben 0.3."),
+        ("Score", "Kombinált rangsor (v2): <code>EPD_anchor × (1 − 0.5×Trend) × min(Vol24h/100k, 5) × K_factor × out_penalty × recency</code>. "
+                   "Ahol <code>EPD_anchor</code> = multi-anchor median profit/d (ha van), különben az ATR-alapú becslés."),
+        ("Anchor median P/d", "Multi-anchor szimuláció eredménye: a múlt OHLCV-jéből 5 különböző anchor-pozícióban szimulálva, a median profit/nap. "
+                                "A min/max tartja a szóródást — minél kisebb a szórás, annál stabilabb."),
+        ("Out of range %", "A multi-anchor szimuláció során hány %-a a candle-oknak volt teljesen KÍVÜL a grid sávján "
+                            "(ár leszakadt vagy kifelé szállt). Magas érték → range-ből kifutó pár, rossz grid. "
+                            "&gt;30% → score büntetés."),
+        ("Recency weight", "<code>ATR_recent_7d / ATR_full_lookback</code> arány, 0.3..2.0 clipped. "
+                            "<b>1.0</b> = stabil; <b>&lt;0.7</b> = csillapodó vol (büntetés); "
+                            "<b>&gt;1.3</b> = növekvő vol (bónusz)."),
+        ("Hurst exponent", "Mandelbrot-féle <b>R/S analysis</b> (rescaled-range). Értelmezés: "
+                            "<b>H&lt;0.5</b> = mean-reverting (anti-persistent, JÓ grid-nek), "
+                            "<b>H≈0.5</b> = random walk, <b>H&gt;0.5</b> = trending (persistent, ROSSZ grid-nek). "
+                            "Score: H&lt;0.4 → ×1.3 bónusz, H&gt;0.6 → ×0.6 büntetés. "
+                            "Forrás: Mandelbrot &amp; Wallis (1969), Hurst (1951)."),
+        ("POC anchor", "<b>Point of Control</b> — Volume Profile legmagasabb density-pontja. "
+                        "A typical price (H+L+C)/3 hisztogramja, volume-mal súlyozva. Top 3 local maxima = "
+                        "azok az árszintek, ahol az ár történetileg a legtöbbet \"polcolt\". "
+                        "Mat. alap: empirikus eloszlás módusza."),
+        ("Crossings (cycles)", "Per-szint <b>crossings count</b>: hányszor metszette át az ár az adott "
+                                "grid szintet (low ≤ level ≤ high). <code>cycles = floor(crossings / 2)</code> "
+                                "(egy le-fel ciklus = legalább 2 metszés). "
+                                "Pontosabb mint a globális <code>ATR/step</code> heurisztika."),
     ]
     rows_html = "".join(
         f"<tr><td><b>{name}</b></td><td>{desc}</td></tr>" for name, desc in rows

@@ -4,6 +4,10 @@
 # === Adatforrás ===
 quote_asset: USDC
 lookback_days: 30                    # mennyi nap visszamenőleg (max ~1000)
+kline_interval: "15m"                # 1m, 3m, 5m, 15m (default), 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d
+                                     # Kisebb = pontosabb intra-candle metrika, de több REST hívás (paginated).
+                                     # 30d × 15m = 2880 candle = 3 hívás/symbol.
+anchor_simulations: 5                # hány különböző anchor-pozíciót szimuláljon a múlt OHLCV-ből
 exclude_symbols: []                  # pl. [BTCUSDC, ETHUSDC] — ha valamit ki akarsz hagyni
 
 # === Likviditás előszűrés ===

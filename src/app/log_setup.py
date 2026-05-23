@@ -70,31 +70,59 @@ def _grid_event_colorizer(logger, method, event_dict):
         qty = event_dict.pop("qty", "")
         value = event_dict.pop("value", "")
         sent_at = event_dict.pop("sent_at", "")
-        latency_ms = event_dict.pop("latency_ms", "")
         event_dict.pop("pair", None)
         event_dict["event"] = (
             f"  {_CYAN}→ {side} COUNTER{_RESET}   lvl {_BOLD}{lvl}{_RESET}\n"
             f"    price {_BOLD}{price}{_RESET}   qty {qty}   value {value}\n"
-            f"    sent {_DIM}{sent_at}{_RESET}   latency {_DIM}{latency_ms}ms{_RESET}\n"
+            f"    sent {_DIM}{sent_at}{_RESET} {_DIM}(lokális küldés — accept külön COUNTER_ACK){_RESET}\n"
             f"{_DIM}{_LINE}{_RESET}"
+        )
+
+    elif event == "COUNTER_ACK":
+        side = event_dict.pop("side", "")
+        lvl = event_dict.pop("lvl", "")
+        accepted_at = event_dict.pop("accepted_at", "")
+        latency_ms = event_dict.pop("latency_ms", "")
+        pair = event_dict.pop("pair", "")
+        # Színezés: <500ms zöld, <2000ms sárga, egyébként piros
+        try:
+            lat_int = int(latency_ms) if latency_ms != "" else 0
+        except (ValueError, TypeError):
+            lat_int = 0
+        if lat_int < 500:
+            lat_color = _GREEN
+        elif lat_int < 2000:
+            lat_color = _YELLOW
+        else:
+            lat_color = _RED
+        event_dict["event"] = (
+            f"  {_CYAN}↳ COUNTER ACK{_RESET}  {_DIM}{pair}{_RESET}  "
+            f"{side} lvl {_BOLD}{lvl}{_RESET}  "
+            f"accepted {_DIM}{accepted_at}{_RESET}  "
+            f"latency (Binance) {lat_color}{_BOLD}{latency_ms}ms{_RESET}"
         )
 
     elif event == "PROFIT":
         realized = event_dict.pop("realized", "")
         matches = event_dict.pop("matches", "")
         per_hour = event_dict.pop("per_hour", "")
+        unrealized = event_dict.pop("unrealized", "")
+        avg_buy_vwap = event_dict.pop("avg_buy_vwap", "")
+        current_price = event_dict.pop("current_price", "")
         portfolio = event_dict.pop("portfolio", "")
         total_pnl = event_dict.pop("total_pnl", "")
         open_base = event_dict.pop("open_base", "")
         open_quote = event_dict.pop("open_quote", "")
         hours = event_dict.pop("hours", "")
         pnl_color = _RED if str(total_pnl).startswith("-") else _GREEN
+        unr_color = _RED if str(unrealized).startswith("-") else _GREEN
         event_dict["event"] = (
             f"\n{_DIM}{_LINE}{_RESET}\n"
             f"{_MAGENTA_BOLD}$ PROFIT{_RESET}  {_DIM}{hours}h{_RESET}\n"
-            f"  realized {_BOLD}{realized}{_RESET}   ({matches} matches, {per_hour}/h)\n"
-            f"  portfolio {_BOLD}{portfolio}{_RESET} USDT   total_pnl {pnl_color}{_BOLD}{total_pnl}{_RESET} USDT\n"
-            f"  open base {open_base}   open quote {open_quote}\n"
+            f"  realized   {_BOLD}{realized}{_RESET}   {_DIM}({matches} matches, {per_hour}/h — grid trade-ek){_RESET}\n"
+            f"  unrealized {unr_color}{_BOLD}{unrealized}{_RESET}   {_DIM}(open {open_base} @ vwap {avg_buy_vwap} → current {current_price}){_RESET}\n"
+            f"  total_pnl  {pnl_color}{_BOLD}{total_pnl}{_RESET}   {_DIM}portfolio {portfolio} USDC{_RESET}\n"
+            f"  wallet:    base {open_base}   quote {open_quote}\n"
             f"{_DIM}{_LINE}{_RESET}"
         )
 

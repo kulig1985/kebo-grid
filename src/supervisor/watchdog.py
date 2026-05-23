@@ -24,6 +24,13 @@ log = get_logger(__name__)
 
 CHECK_INTERVAL = 5.0  # másodperc
 
+# Binance WS limit-barát értékek:
+# - 300 conn / 5 perc / IP → két force-close között legalább 60s
+# - frissen csatlakozott connection-nek időt kell adni stabilizálódni
+RECONNECT_WARMUP_SEC = 60       # új connection-nek ennyi mp-ig nem szabad force-close
+FORCE_CLOSE_DEBOUNCE_SEC = 60   # két force-close közötti minimum idő
+STABLE_RESET_SEC = 300          # ennyi mp folyamatos friss üzenet után reset a count
+
 
 class Watchdog:
     def __init__(
@@ -46,6 +53,7 @@ class Watchdog:
         self._ws_stale_warned = False
         self._stale_force_close_count = 0
         self._last_force_close_ts: float = 0.0
+        self._last_stable_check_ts: float = 0.0
 
     async def run(self) -> None:
         self._running = True
@@ -82,11 +90,20 @@ class Watchdog:
                 self._ws_stale_warned = True
         elif ws_age > idle_limit:
             now = time.monotonic()
-            # Debounce: a force close után adjunk legalább 30s-et a reconnect-re mielőtt újraértékelünk
-            if now - self._last_force_close_ts < 30:
+            # Debounce: két force-close között legalább FORCE_CLOSE_DEBOUNCE_SEC mp
+            if now - self._last_force_close_ts < FORCE_CLOSE_DEBOUNCE_SEC:
+                return
+            # Warm-up: ha a friss connection még nem volt elég ideig fent, ne számítson
+            # force-close-nak (a Binance lezárhatja "1000 OK"-val tisztán is)
+            if now - self.ws_api._connect_time < RECONNECT_WARMUP_SEC:
+                log.debug(
+                    "WS reconnect warm-up alatt — force-close kihagyva",
+                    connect_age=f"{now - self.ws_api._connect_time:.0f}s",
+                )
                 return
             self._stale_force_close_count += 1
             self._last_force_close_ts = now
+            self._last_stable_check_ts = now  # új force-close → stabilizálódási timer újraindul
             log.warning(
                 "Trading WS stale — force reconnect",
                 age_sec=f"{ws_age:.0f}s",
@@ -99,9 +116,22 @@ class Watchdog:
                 )
                 return
         else:
-            # Élő és friss → reset
+            # Élő és friss üzenetek → warning törlése
             self._ws_stale_warned = False
-            self._stale_force_close_count = 0
+            now = time.monotonic()
+            # A stale-számláló csak akkor reset, ha a connection már elég ideje stabil.
+            # Így a "1× stale → reconnect → 30s friss → megint stale" forgatókönyv
+            # nem nullázza azonnal a számlálót, és tényleg eljut emergency-be ha kell.
+            if self._stale_force_close_count > 0:
+                if self._last_stable_check_ts == 0:
+                    self._last_stable_check_ts = now
+                elif now - self._last_stable_check_ts > STABLE_RESET_SEC:
+                    log.info(
+                        "WS stabilan fut — stale számláló reset",
+                        prev_count=self._stale_force_close_count,
+                    )
+                    self._stale_force_close_count = 0
+                    self._last_stable_check_ts = 0.0
 
         # DB writer queue telítettség
         if self.config.emergency_stop_on_db_queue_full:

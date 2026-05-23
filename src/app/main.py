@@ -207,6 +207,8 @@ async def _handle_execution_report(
     # ACK tracking — Binance NEW = az exchange elfogadta az ordert
     if report.execution_type == "NEW":
         engine._order_acked_set.add(cid)
+        # Counter ACK log (Binance-órán mért fill→ACK latency)
+        engine.on_counter_ack(report)
 
     if report.order_status == "FILLED":
         await engine.on_execution_report(report)
@@ -736,11 +738,11 @@ async def main() -> None:
         except Exception: pass
 
         try:
+            # Emergency esetén is futtatjuk a graceful_shutdown-t, mert ott REST fallback van
+            # (PONT akkor halott a WS amikor emergency történik → REST mentheti a helyzetet)
+            await graceful_shutdown(settings, engine, ws_api, db_queue, symbol)
             if engine.status not in ("EMERGENCY_STOPPING", "EMERGENCY_STOPPED"):
-                await graceful_shutdown(settings, engine, ws_api, db_queue, symbol)
                 engine.status = "STOPPED"
-            else:
-                log.info("Emergency állapot — graceful shutdown skip")
         except Exception as e:
             log.error("Graceful shutdown crash — last resort DB STOPPED", error=str(e))
             # Last resort: közvetlen DB-frissítés a status-ra

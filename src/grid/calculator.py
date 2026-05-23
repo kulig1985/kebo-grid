@@ -214,10 +214,16 @@ class GridCalculator:
             ))
 
         # Sell szintek: P0 * r^i, i=1..K_sell
+        # FONTOS: a sell qty FIX (V/anchor) — szándékos design a base inventory neutralitás miatt.
+        # Egy SELL+i fill → counter BUY anchor körül; ha a SELL qty változó lenne (V/sell_price),
+        # akkor az inventory minden cycle után drift-elne (kicsi base akkumuláció).
+        # A jelenlegi design: minden SELL ugyanannyi base-t ad el → counter BUY ugyanannyit vesz vissza
+        # → inventory pontosan visszaáll. A "plusz quote" (felső szinteken több mint V) a geometriai
+        # grid kompound profit-tartaléka, nem aszimmetria.
         for i in range(1, k_sell + 1):
             raw_price = anchor_price * (r ** i)
             price, _ = adjust_order_to_filters(raw_price, Decimal("1"), symbol_info)
-            raw_qty = order_quote_value / anchor_price  # anchor price-on számított qty
+            raw_qty = order_quote_value / anchor_price  # anchor-on számolt FIX qty (lásd komment fent)
             qty = round_down_to_step(raw_qty, symbol_info.lot_size.step_size)
             notional = qty * price
 
