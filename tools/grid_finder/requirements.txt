@@ -1,5 +1,7 @@
-pandas>=2.0
-numpy>=1.26
-plotly>=5.20
+# Lazább constraintek hogy Python 3.8+ alatt is fusson (VPS támogatás).
+# Python 3.8 → numpy max 1.24.x, pandas max 2.0.x; Python 3.11+ → minden új verzió jó.
+pandas>=1.5
+numpy>=1.21
+plotly>=5.0
 pyyaml>=6.0
-httpx>=0.27
+httpx>=0.24

@@ -35,11 +35,21 @@ Standalone elemző script — Binance USDC párok rangsorolása grid bot szempon
 
 **NEM backteszt** — csak leíró stat. OHLCV-ből nem lehet pontosan grid működést szimulálni.
 
-## Telepítés
+## Telepítés (venv-vel — VPS-en is működik)
+
+A rendszer python-jának piszkolása nélkül, izolált virtualenv-ben:
 
 ```bash
 cd tools/grid_finder
-pip install -r requirements.txt
+./setup.sh            # létrehoz .venv-t és telepít minden függőséget
+```
+
+A `setup.sh` automatikusan a legmagasabb elérhető Python verziót használja
+(3.12 → 3.11 → 3.10 → 3.9 → 3 fallback). Python **3.8+** kompatibilis.
+
+Ha nincs `python3-venv` csomag a VPS-en:
+```bash
+sudo apt install python3-venv python3-pip
 ```
 
 ## Használat
@@ -49,10 +59,18 @@ cp config.example.yaml config.yaml
 # szerkeszd a config.yaml-t (capital, target_profit_pct, fee, stb.)
 
 # Első futtatás (Binance REST fetch):
-python finder.py config.yaml
+./run.sh config.yaml
 
 # Offline újra-szimuláció (NEM fetcheli újra, csak a meglévő CSV-ből):
-python finder.py config.yaml --from-csv
+./run.sh config.yaml --from-csv
+```
+
+A `run.sh` aktiválja a `.venv`-et és a finder.py-t futtatja. Ha valami miatt
+közvetlenül akarod hívni:
+
+```bash
+source .venv/bin/activate
+python finder.py config.yaml
 ```
 
 Az `--from-csv` mód hasznos ha **csak a config-ot változtatod** (capital, target_pct, fee, buffer)
@@ -60,6 +78,7 @@ Az `--from-csv` mód hasznos ha **csak a config-ot változtatod** (capital, targ
 
 Output:
 - `output/report.html` — interaktív Plotly riport (glosszárium + számítási példa + 4 grafikon)
+- `output/report.md` — **markdown riport** (VPS-en böngésző nélkül is olvasható: `less output/report.md`)
 - `output/data.csv` — raw eredmények (Excel/scripting-hez)
 - `output/configs/<symbol>.yaml` — **kész bot config** a top 5 párra. Elinditasához:
   ```bash

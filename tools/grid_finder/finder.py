@@ -7,6 +7,7 @@ NEM backteszt — csak leíró stat + a config bot paramétereivel elméleti szi
 Használat:
     python finder.py config.yaml
 """
+from __future__ import annotations  # PEP 563: list[...] működjön Python 3.8 alatt is
 
 import math
 import sys
@@ -634,6 +635,7 @@ def main(config_path: str, from_csv: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "data.csv"
     html_path = out_dir / "report.html"
+    md_path = out_dir / "report.md"
 
     if from_csv:
         # Offline mód: a meglévő CSV-ből újra szimulál (új config paraméterekkel)
@@ -713,6 +715,8 @@ def main(config_path: str, from_csv: bool = False) -> None:
         print(f"[+] {len(df)} symbol újraszámolva")
         generate_html_report(df, cfg, html_path)
         print(f"[+] HTML report: {html_path}")
+        generate_md_report(df, cfg, md_path)
+        print(f"[+] MD report:   {md_path}")
         generate_bot_configs(df, cfg, out_dir, top_n=5)
         _print_top5(df)
         return
@@ -816,6 +820,8 @@ def main(config_path: str, from_csv: bool = False) -> None:
     print(f"[4/4] CSV mentve: {csv_path}")
     generate_html_report(df, cfg, html_path)
     print(f"      HTML report: {html_path}")
+    generate_md_report(df, cfg, md_path)
+    print(f"      MD report:   {md_path}")
     generate_bot_configs(df, cfg, out_dir, top_n=5)
     _print_top5(df)
 
@@ -981,6 +987,306 @@ def _format_price(p) -> str:
     if p < 100:
         return f"{p:.4f}"
     return f"{p:.2f}"
+
+
+def _hurst_marker(h: float) -> str:
+    if h < 0.4:
+        return "🟢 mean-rev"
+    if h > 0.6:
+        return "🔴 trending"
+    return "🟡 random"
+
+
+def _minnot_marker(mn: float) -> str:
+    if mn <= 1.0:
+        return "🟢"
+    if mn <= 5.0:
+        return "🟡"
+    return "🔴"
+
+
+def _out_range_marker(p: float) -> str:
+    if p <= 10:
+        return "🟢"
+    if p <= 30:
+        return "🟡"
+    return "🔴"
+
+
+def _md_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Egyszerű markdown tábla — minden cella string."""
+    head = "| " + " | ".join(headers) + " |"
+    sep = "|" + "|".join("---" for _ in headers) + "|"
+    body = "\n".join("| " + " | ".join(r) + " |" for r in rows)
+    return f"{head}\n{sep}\n{body}"
+
+
+def generate_md_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
+    """Markdown riport — VPS-en (böngésző nélkül) is olvasható."""
+    top_n = int(cfg["top_n"])
+    top = df.head(top_n).reset_index(drop=True)
+    bot = cfg["bot"]
+    quote = cfg["quote_asset"]
+    lookback = int(cfg["lookback_days"])
+
+    has_hurst = "hurst_exponent" in top.columns
+    has_anchor = "anchor_median_profit_per_day" in top.columns and (
+        top["anchor_median_profit_per_day"].fillna(0).abs().sum() > 0
+    )
+    has_vp = "vp_anchor_1_price" in top.columns and (
+        top["vp_anchor_1_price"].fillna(0).abs().sum() > 0
+    )
+
+    parts: list[str] = []
+    parts.append("# 🎯 Grid Pair Finder Report\n")
+    parts.append(
+        f"**Quote:** `{quote}` | **Lookback:** {lookback} nap | "
+        f"**Symbol-ok:** {len(df)} (likviditás ≥ {cfg['min_volume_24h_quote']:.0f})  \n"
+        f"**Tőke:** {bot['capital_quote']} {quote} | "
+        f"**target_profit_pct:** {bot['target_profit_pct']*100:.2f}% | "
+        f"**fee:** {bot['fee_buy']*100:.3f}%/{bot['fee_sell']*100:.3f}% | "
+        f"**buffer:** {bot['base_buffer_pct']*100:.0f}% | "
+        f"**max_grid_levels:** {bot['max_grid_levels']}\n"
+    )
+    parts.append(
+        "> ⚠ **FONTOS:** Ez NEM backteszt. A *becsült profit/nap* egy DURVA HEURISZTIKA — "
+        "feltételezi hogy a napi átlagos ár-mozgás (ATR) hányszor megy keresztül a step-en, "
+        "és minden szint párhuzamosan termel. A valódi profit függ a mozgás jellegétől, "
+        "order book likviditástól, slippage-től. **A számok a relatív rangsoroláshoz használhatók, "
+        "NEM abszolút garancia.**\n"
+    )
+
+    # ── 1. TOP N tábla ──────────────────────────────────────────────
+    parts.append(f"\n## 📊 Top {top_n} jelölt\n")
+    headers = ["#", "Symbol", "K", "Step%", "Vol(d)%", "ATR%", "Range%",
+               "Trend(R²)", "Hurst", "Vol24h(k)", "MinNot", "Cycle/d",
+               "Profit/d", "Days→100", "Score"]
+    rows = []
+    for i, row in top.iterrows():
+        d100 = row.get("days_to_100_usdc", None)
+        d100s = f"{int(d100)}" if d100 and not (isinstance(d100, float) and math.isnan(d100)) else "∞"
+        hurst_v = row.get("hurst_exponent", 0.5) if has_hurst else 0.5
+        hurst_cell = f"{hurst_v:.2f} {_hurst_marker(hurst_v)}" if has_hurst else "–"
+        rows.append([
+            str(i + 1),
+            f"`{row['symbol']}`",
+            str(int(row["K"])),
+            f"{row['step_pct']:.2f}",
+            f"{row['realized_vol_daily']*100:.2f}",
+            f"{row['atr_pct']:.2f}",
+            f"{row['range_pct_lookback']:.1f}",
+            f"{row['trend_strength']:.2f}",
+            hurst_cell,
+            f"{row['volume_24h_quote']/1000:.0f}",
+            f"{row['min_notional']:.2f} {_minnot_marker(row['min_notional'])}",
+            f"{row['est_cycles_per_day']:.1f}",
+            f"{row['est_profit_per_day']:.3f}",
+            d100s,
+            f"{row['score']:.2f}",
+        ])
+    parts.append(_md_table(headers, rows))
+    parts.append(
+        "\n> **Színkód:** Hurst — 🟢 <0.4 mean-rev (jó) · 🟡 0.4–0.6 random · 🔴 >0.6 trending (rossz) | "
+        "MinNot — 🟢 ≤1 · 🟡 ≤5 · 🔴 >5\n"
+    )
+
+    # ── 2. Multi-anchor részletek ───────────────────────────────────
+    if has_anchor:
+        parts.append("\n## 🎯 Multi-anchor szimuláció (top 10)\n")
+        parts.append(
+            "Volume Profile (POC) alapú anchor jelöltek, mindegyikre per-szint crossings.  \n"
+            "`cycles = floor(crossings/2)` per szint — pontosabb mint a globális `ATR/step` heurisztika.\n"
+        )
+        anc_n = min(10, len(top))
+        atop = top.head(anc_n)
+        ah = ["#", "Symbol", "Median P/d", "Min P/d", "Max P/d", "P/d Spread",
+              "Out-Range%", "Recency"]
+        ar = []
+        for i, r in atop.iterrows():
+            spread = float(r["anchor_max_profit_per_day"] - r["anchor_min_profit_per_day"])
+            out_pct = float(r["out_of_range_pct"])
+            rec = float(r.get("recency_weight", 1.0))
+            rec_mark = "🔴" if rec < 0.7 else ("🟡" if rec < 0.9 else "🟢")
+            ar.append([
+                str(i + 1),
+                f"`{r['symbol']}`",
+                f"{r['anchor_median_profit_per_day']:.4f}",
+                f"{r['anchor_min_profit_per_day']:.4f}",
+                f"{r['anchor_max_profit_per_day']:.4f}",
+                f"{spread:.4f}",
+                f"{out_pct:.1f} {_out_range_marker(out_pct)}",
+                f"{rec:.2f} {rec_mark}",
+            ])
+        parts.append(_md_table(ah, ar))
+        parts.append(
+            "\n> **Out-Range** — 🟢 ≤10% · 🟡 ≤30% · 🔴 >30% (range-ből kifutó pár) | "
+            "**Recency** — 🔴 <0.7 csillapodó vol · 🟡 <0.9 · 🟢 ≥0.9 stabil/emelkedő\n"
+        )
+
+    # ── 3. Volume Profile (POC) anchor jelöltek ─────────────────────
+    if has_vp:
+        parts.append("\n## 📍 Volume Profile / POC anchor jelöltek (top 10)\n")
+        parts.append(
+            "*Best anchor* = a multi-anchor szim legmagasabb profit/d-eredménye. "
+            "*POC #1-3* = top 3 volume-density csúcs (typical price hisztogram, "
+            "volume-mal súlyozva).\n"
+        )
+        vp_n = min(10, len(top))
+        vptop = top.head(vp_n)
+        vh = ["#", "Symbol", "Current", "Best Anchor", "Δ% (best vs cur)",
+              "POC #1", "Share #1", "POC #2", "Share #2", "POC #3"]
+        vr = []
+        for i, r in vptop.iterrows():
+            cur = float(r["current_price"])
+            best = float(r["best_anchor_price"])
+            diff = (best - cur) / cur * 100 if cur > 0 and best > 0 else 0.0
+            vr.append([
+                str(i + 1),
+                f"`{r['symbol']}`",
+                _format_price(cur),
+                _format_price(best),
+                f"{diff:+.2f}%",
+                _format_price(r["vp_anchor_1_price"]),
+                f"{r['vp_anchor_1_share']*100:.1f}%",
+                _format_price(r["vp_anchor_2_price"]),
+                f"{r['vp_anchor_2_share']*100:.1f}%",
+                _format_price(r["vp_anchor_3_price"]),
+            ])
+        parts.append(_md_table(vh, vr))
+
+    # ── 4. Sensitivity heatmap (mint MD tábla) ──────────────────────
+    target_pcts = [0.001, 0.002, 0.005, 0.01, 0.02, 0.04]
+    sens_n = min(15, len(top))
+    parts.append(f"\n## 🔥 Érzékenység: profit/nap különböző target_profit_pct mellett (top {sens_n})\n")
+    sh = ["Symbol"] + [f"{tp*100:.1f}%" for tp in target_pcts]
+    sr = []
+    for _, srow in top.head(sens_n).iterrows():
+        cells = [f"`{srow['symbol']}`"]
+        for tp in target_pcts:
+            cfg_alt = dict(bot)
+            cfg_alt["target_profit_pct"] = tp
+            sim = simulate_bot(
+                {"atr_pct": float(srow["atr_pct"])},
+                {"min_notional": float(srow["min_notional"])},
+                cfg_alt,
+            )
+            cells.append(f"{sim['est_profit_per_day']:.3f}")
+        sr.append(cells)
+    parts.append(_md_table(sh, sr))
+
+    # ── 5. Konkrét számítási példa a #1-re ──────────────────────────
+    if len(df) > 0:
+        parts.append("\n## 🧮 Konkrét számítási példa — #1 jelölt\n")
+        parts.append(_build_example_md(df.iloc[0], cfg))
+
+    # ── 6. Glosszárium ──────────────────────────────────────────────
+    parts.append("\n## 📖 Oszlopok magyarázata\n")
+    parts.append(_build_glossary_md(cfg))
+
+    parts.append(
+        "\n---\n"
+        "*Offline újra-szimuláció (ha config változott — nem fetcheli újra):*  \n"
+        "`./run.sh config.yaml --from-csv`\n\n"
+        f"*Adatforrás: Binance public REST API · {cfg['kline_interval']} OHLCV × {lookback} nap.*\n"
+    )
+
+    out_path.write_text("\n".join(parts), encoding="utf-8")
+
+
+def _build_example_md(top_row: pd.Series, cfg: dict) -> str:
+    bot = cfg["bot"]
+    sym = top_row["symbol"]
+    min_not = float(top_row["min_notional"])
+    capital = float(bot["capital_quote"])
+    reserve = float(bot["quote_reserve_pct"])
+    max_levels = int(bot["max_grid_levels"])
+    fb = float(bot["fee_buy"])
+    fs = float(bot["fee_sell"])
+    buffer = float(bot["base_buffer_pct"])
+    target = float(bot["target_profit_pct"])
+
+    available = capital * (1 - reserve)
+    per_level_auto = available / max_levels
+    min_safe = min_not * 1.1
+    V = max(per_level_auto, min_safe)
+    bps = V * (1 + buffer) / (1 - fb)
+    cost_pair = V + bps
+    K = int(available // cost_pair)
+    K = min(K, max_levels // 2)
+    step = (1 + target) / ((1 - fb) * (1 - fs)) - 1
+    profit_cycle = V * target
+    atr = float(top_row["atr_pct"])
+    cycles = atr / 100 / step if step > 0 else 0
+    profit_day = profit_cycle * cycles * K
+
+    return (
+        f"**Pár:** `{sym}` | **min_notional:** {min_not:.4f} {cfg['quote_asset']} | "
+        f"**{cfg['lookback_days']} napi ATR:** {atr:.2f}%\n\n"
+        f"1. **Per-szint érték (V)**  \n"
+        f"   `V = max(min_notional × 1.1, capital / max_grid_levels)`  \n"
+        f"   `V = max({min_not:.4f} × 1.1, {capital} / {max_levels}) = max({min_safe:.4f}, {per_level_auto:.4f})`  \n"
+        f"   **V = {V:.4f} {cfg['quote_asset']}**\n\n"
+        f"2. **Bootstrap / sell szint**  \n"
+        f"   `bootstrap_per_sell = V × (1 + buffer) / (1 - fee_buy)`  \n"
+        f"   `= {V:.4f} × {1+buffer:.4f} / {1-fb:.5f}` → **{bps:.4f} {cfg['quote_asset']}**\n\n"
+        f"3. **Pár-költség (1 BUY + 1 SELL)**  \n"
+        f"   `cost_pair = V + bootstrap_per_sell = {V:.4f} + {bps:.4f}` → **{cost_pair:.4f} {cfg['quote_asset']}**\n\n"
+        f"4. **Hány szimmetrikus pár (K)**  \n"
+        f"   `available = {capital} × (1 - {reserve}) = {available:.2f}`  \n"
+        f"   `K = floor({available:.2f} / {cost_pair:.4f})` → **K = {K}** ({K} BUY + {K} SELL = {2*K} szint)\n\n"
+        f"5. **Step %**  \n"
+        f"   `step = (1 + target) / ((1 - fee_buy) × (1 - fee_sell)) − 1`  \n"
+        f"   `= (1 + {target}) / ((1 - {fb}) × (1 - {fs})) − 1` → **{step*100:.4f}%**\n\n"
+        f"6. **Profit / cycle**  \n"
+        f"   `profit_per_cycle = V × target = {V:.4f} × {target}` → **{profit_cycle:.4f} {cfg['quote_asset']}**\n\n"
+        f"7. **Becsült cycle / nap (heuristic)**  \n"
+        f"   `cycles/d ≈ ATR% / step% = {atr:.2f}% / {step*100:.4f}%` → **{cycles:.2f}**\n\n"
+        f"8. **Becsült profit / nap**  \n"
+        f"   `est_profit/d = profit_per_cycle × cycles/d × K = {profit_cycle:.4f} × {cycles:.2f} × {K}`  \n"
+        f"   → **{profit_day:.4f} {cfg['quote_asset']}** (K szint párhuzamosan termel — optimista)\n\n"
+        f"9. **Days → 100 {cfg['quote_asset']}**  \n"
+        f"   `100 / {profit_day:.4f}` → **{100/profit_day:.0f} nap**\n\n"
+        f"> ⚠ Ez egy *elméleti* profit potenciál. A valódi cycle szám függ attól, hogy a {cfg['lookback_days']} "
+        f"napi ATR-mozgás **folyamatos oszcilláció** volt-e (jó grid-nek) vagy **egyirányú trend** (rossz). "
+        f"Ezért a Trend (R²) is bele van számítva a final score-ba.\n"
+    )
+
+
+def _build_glossary_md(cfg: dict) -> str:
+    lookback = int(cfg["lookback_days"])
+    atr_period = min(14, lookback)
+    quote = cfg["quote_asset"]
+    rows = [
+        ("Symbol", f"Binance symbol pl. `SOLUSDC`. baseAsset+quoteAsset."),
+        ("K", "Hány BUY és hány SELL szint férne be a tőkébe (szimmetrikus, k_buy=k_sell=K). "
+              "`K = floor(available / (V + bootstrap_per_sell))` ahol "
+              "`V = max(min_notional × 1.1, capital / max_grid_levels)`. K<3 → score büntetve (×0.3)."),
+        ("Step%", "Két szomszédos szint %-os ár-távolsága. "
+                  "`step = (1 + target_profit_pct) / ((1 - fee_buy) × (1 - fee_sell)) − 1`."),
+        ("Vol(d)%", f"Realizált napi volatilitás %-ban — {lookback} napi log-return-ek szórása."),
+        ("ATR%", f"Average True Range {atr_period}d átlag, %-ban. "
+                  "`ATR% = mean(TR) / mean_close × 100`."),
+        ("Range%", f"`(max - min) / mean × 100` az elmúlt {lookback} napra."),
+        ("Trend(R²)", f"Lineáris regresszió R² a {lookback} napi close-ra. 0=range (jó), 1=trend (rossz)."),
+        ("Hurst", "R/S analysis (Mandelbrot). <0.4 mean-reverting (jó, ×1.3 bónusz), "
+                  "0.4–0.6 random walk, >0.6 trending (rossz, ×0.6 büntetés)."),
+        ("Vol24h(k)", f"Elmúlt 24h forgalom {quote}-ben, ezerben."),
+        ("MinNot", f"Binance minNotional filter: legkisebb {quote}-értékű order. Meghatározza V alsó korlátját."),
+        ("Cycle/d", "Becsült cycle/nap: `ATR% / step%`. Durva közelítés."),
+        ("Profit/d", f"`profit_per_cycle × cycles/d × K`. Optimista (K szint párhuzamosan termel)."),
+        ("Days→100", f"`100 / Profit/d` — hány nap kell 100 {quote} profithoz."),
+        ("Score", "`EPD_anchor × (1 − 0.5×Trend) × min(Vol24h/100k, 5) × K_factor × out_penalty × recency × hurst_factor`. "
+                   "EPD_anchor = multi-anchor median profit/d ha van, különben az ATR-alapú becslés."),
+        ("Anchor median P/d", "Multi-anchor szimuláció — 5 POC-anchor-pozícióban szimulálva, median profit/nap. "
+                                "A spread (max-min) mutatja a stabilitást."),
+        ("Out-Range%", "A multi-anchor szim során hány %-a a candle-oknak volt teljesen KÍVÜL a grid sávján. "
+                        ">30% → score büntetés."),
+        ("Recency", "`ATR_recent_7d / ATR_full_lookback`, 0.3..2.0 clipped. "
+                     "<0.7 csillapodó (büntetés), >1.3 emelkedő vol (bónusz)."),
+        ("POC anchor", "Point of Control — Volume Profile legmagasabb density-pontja "
+                        "(typical price hisztogram, volume-súlyozva)."),
+    ]
+    return _md_table(["Oszlop", "Magyarázat"], [[f"**{n}**", d] for n, d in rows])
 
 
 def generate_html_report(df: pd.DataFrame, cfg: dict, out_path: Path) -> None:
