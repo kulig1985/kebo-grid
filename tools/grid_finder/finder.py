@@ -717,7 +717,7 @@ def main(config_path: str, from_csv: bool = False) -> None:
         print(f"[+] HTML report: {html_path}")
         generate_md_report(df, cfg, md_path)
         print(f"[+] MD report:   {md_path}")
-        generate_bot_configs(df, cfg, out_dir, top_n=5)
+        generate_bot_configs(df, cfg, out_dir, top_n=10)
         _print_top5(df)
         return
 
@@ -822,7 +822,7 @@ def main(config_path: str, from_csv: bool = False) -> None:
     print(f"      HTML report: {html_path}")
     generate_md_report(df, cfg, md_path)
     print(f"      MD report:   {md_path}")
-    generate_bot_configs(df, cfg, out_dir, top_n=5)
+    generate_bot_configs(df, cfg, out_dir, top_n=10)
     _print_top5(df)
 
 
@@ -839,7 +839,7 @@ def _print_top5(df: pd.DataFrame) -> None:
 # Bot config generálás (top N párokra kész tiausdc-szerű YAML)
 # ────────────────────────────────────────────────────────────────
 
-def generate_bot_configs(df: pd.DataFrame, cfg: dict, out_dir: Path, top_n: int = 5) -> None:
+def generate_bot_configs(df: pd.DataFrame, cfg: dict, out_dir: Path, top_n: int = 10) -> None:
     """A top N párokhoz külön bot config YAML-eket generál (tiausdc.yaml mintájára)."""
     cfg_dir = out_dir / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
