@@ -655,6 +655,7 @@ async def main() -> None:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(ws_api.writer_loop(), name="ws_writer")
             tg.create_task(ws_api.reader_loop(), name="ws_reader")
+            tg.create_task(ws_api.heartbeat_loop(), name="ws_heartbeat")
             tg.create_task(user_stream.start(), name="user_stream")
             tg.create_task(market_stream.start(), name="market_stream")
             tg.create_task(db_writer.run(), name="db_writer")

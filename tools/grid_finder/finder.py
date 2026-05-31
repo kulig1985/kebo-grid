@@ -933,7 +933,7 @@ safety:
   cancel_retry_max: 5
   emergency_stop_on_db_queue_full: true
   emergency_stop_on_balance_mismatch: true
-  sell_on_emergency_stop: false
+  sell_on_emergency_stop: true
   shutdown_action: cancel_and_sell
   reconciliation_interval_sec: 60
   profit_report_interval_sec: 600

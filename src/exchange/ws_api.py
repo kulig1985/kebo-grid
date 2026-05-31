@@ -31,6 +31,11 @@ RECONNECT_BASE_DELAY = 1.0
 RECONNECT_MAX_DELAY = 60.0
 RECONNECT_BEFORE_HOURS = 23  # 24h limit előtt 1 órával cseréljük
 
+# Application-level heartbeat: detektálja a "csatlakozva de Binance nem válaszol" hibát
+HEARTBEAT_INTERVAL_SEC = 30
+HEARTBEAT_TIMEOUT_SEC = 8
+HEARTBEAT_FAIL_LIMIT = 2  # ennyi consecutive timeout után force-reconnect
+
 
 @dataclass
 class WsSendCommand:
@@ -141,9 +146,9 @@ class BinanceWsApi:
             max_size=10 * 1024 * 1024,
         )
         self._connect_time = time.monotonic()
-        # Warm-up: friss connection-nek "0 mp idő óta kapott üzenetet" számít,
-        # hogy az új kapcsolat ne számítson azonnal stale-nek a régi timer alapján.
-        self._last_msg_time = time.monotonic()
+        # FONTOS: _last_msg_time-ot NEM resetelünk itt — különben a watchdog
+        # nem látja a "csatlakozva de Binance nem válaszol" csendes hibát.
+        # A warm-up védelmet a watchdog _connect_time alapján már biztosítja.
         self._connected.set()
         log.info("WS API csatlakozva")
 
@@ -411,6 +416,62 @@ class BinanceWsApi:
             "symbol": symbol,
             "origClientOrderId": client_order_id,
         })
+
+    async def heartbeat_loop(self) -> None:
+        """
+        Application-level heartbeat: 30s-enként lightweight 'time' query.
+
+        Az is_connected==True nem garantálja, hogy a Binance válaszol — előfordult,
+        hogy 24h reconnect után az új connection csendben nem szolgált ki query-ket
+        (listenKey ping, openOrders.status timeout). A websockets protokoll szintű
+        ping/pong erre vak.
+
+        2 consecutive timeout → force-reconnect azonnal (nem várunk a 5 perc stale-re).
+        """
+        consecutive_failures = 0
+        # Adunk egy kis indulási late-et, hogy az első connect ne épp az indulás
+        # másodpercében essen
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        while self._running:
+            try:
+                if not self.is_connected:
+                    consecutive_failures = 0
+                    await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+                    continue
+                # Külön request, rövidebb timeout-tal — nem akarunk 10s-ot várni
+                request_id = str(uuid.uuid4())
+                future: asyncio.Future = asyncio.get_event_loop().create_future()
+                self._pending[request_id] = future
+                cmd = WsSendCommand(
+                    request_id=request_id,
+                    method="time",
+                    params={},
+                    is_authenticated=False,
+                )
+                self.send_queue.put_nowait(cmd)
+                try:
+                    await asyncio.wait_for(future, timeout=HEARTBEAT_TIMEOUT_SEC)
+                    consecutive_failures = 0
+                except asyncio.TimeoutError:
+                    self._pending.pop(request_id, None)
+                    consecutive_failures += 1
+                    log.warning(
+                        "WS heartbeat timeout",
+                        attempt=consecutive_failures,
+                        limit=HEARTBEAT_FAIL_LIMIT,
+                    )
+                    if consecutive_failures >= HEARTBEAT_FAIL_LIMIT:
+                        log.error(
+                            "WS heartbeat halott — force reconnect",
+                            failures=consecutive_failures,
+                        )
+                        await self.force_reconnect("heartbeat_dead")
+                        consecutive_failures = 0
+                        # Adjunk időt a reconnect-nek
+                        await asyncio.sleep(5)
+            except Exception as e:
+                log.error("WS heartbeat hiba", error=str(e))
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
 
     async def stop(self) -> None:
         self._running = False

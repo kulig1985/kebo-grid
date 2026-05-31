@@ -54,6 +54,9 @@ class Watchdog:
         self._stale_force_close_count = 0
         self._last_force_close_ts: float = 0.0
         self._last_stable_check_ts: float = 0.0
+        # _last_msg_time amikor utoljára force-close-oltunk — csak akkor reset-eljük
+        # a számlálót, ha az új connection-en VALÓDI új üzenet érkezett azóta.
+        self._last_msg_time_at_force_close: float = 0.0
 
     async def run(self) -> None:
         self._running = True
@@ -104,6 +107,7 @@ class Watchdog:
             self._stale_force_close_count += 1
             self._last_force_close_ts = now
             self._last_stable_check_ts = now  # új force-close → stabilizálódási timer újraindul
+            self._last_msg_time_at_force_close = self.ws_api._last_msg_time
             log.warning(
                 "Trading WS stale — force reconnect",
                 age_sec=f"{ws_age:.0f}s",
@@ -123,6 +127,12 @@ class Watchdog:
             # Így a "1× stale → reconnect → 30s friss → megint stale" forgatókönyv
             # nem nullázza azonnal a számlálót, és tényleg eljut emergency-be ha kell.
             if self._stale_force_close_count > 0:
+                # CSAK akkor számít stabilnak, ha az utolsó force-close ÓTA VALÓDI új
+                # üzenet érkezett (különben csak a _connect() warm-up oszcillál).
+                current_msg_time = self.ws_api._last_msg_time
+                if current_msg_time <= self._last_msg_time_at_force_close:
+                    # Nincs új üzenet az utolsó force-close óta — ne hamisan resetel.
+                    return
                 if self._last_stable_check_ts == 0:
                     self._last_stable_check_ts = now
                 elif now - self._last_stable_check_ts > STABLE_RESET_SEC:
